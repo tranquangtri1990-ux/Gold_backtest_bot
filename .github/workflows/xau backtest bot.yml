@@ -26,7 +26,20 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pandas numpy pyTelegramBotAPI tvdatafeed
+        pip install pandas numpy pyTelegramBotAPI
+        # tvdatafeed bị xóa khỏi PyPI → cài từ GitHub
+        pip install --upgrade --no-cache-dir git+https://github.com/StreamAlpha/tvdatafeed.git
+
+    - name: Notify Telegram - Start
+      if: always()
+      run: |
+        TRIGGER="${{ github.event_name }}"
+        RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        MSG="🚀 <b>XAU Bot started</b>%0ATrigger: <code>${TRIGGER}</code>%0A<a href='${RUN_URL}'>View run</a>"
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BT_VangDo_bot_API }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d parse_mode="HTML" \
+          -d text="${MSG}" > /dev/null
 
     - name: Run XAU Backtest Bot
       env:
@@ -34,3 +47,23 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
         timeout 540 python xau_backtest_bot.py || true
+
+    - name: Notify Telegram - Success
+      if: success()
+      run: |
+        RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        MSG="✅ <b>XAU Bot finished OK</b>%0A<a href='${RUN_URL}'>View run</a>"
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BT_VangDo_bot_API }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d parse_mode="HTML" \
+          -d text="${MSG}" > /dev/null
+
+    - name: Notify Telegram - Failure
+      if: failure()
+      run: |
+        RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        MSG="❌ <b>XAU Bot FAILED</b>%0A<a href='${RUN_URL}'>View logs</a>"
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BT_VangDo_bot_API }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d parse_mode="HTML" \
+          -d text="${MSG}" > /dev/null
