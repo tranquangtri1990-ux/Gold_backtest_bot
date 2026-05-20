@@ -100,23 +100,30 @@ class XAUUSDBacktester:
             return None
     
     def calculate_rsi_wilder(self, prices: pd.Series, period: int = 14) -> pd.Series:
-        """Calculate RSI using Wilder's smoothing"""
+        """Calculate RSI using Wilder's smoothing (TradingView method)"""
+        # Calculate price changes
         delta = prices.diff()
-        gain = delta.copy()
-        loss = delta.copy()
-        gain[gain < 0] = 0
-        loss[loss > 0] = 0
-        loss = loss.abs()
         
+        # Separate gains and losses
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        
+        # Initialize average gain/loss with simple moving average
         avg_gain = gain.rolling(window=period).mean()
         avg_loss = loss.rolling(window=period).mean()
         
-        for i in range(period, len(gain)):
-            avg_gain.iloc[i] = (avg_gain.iloc[i-1] * (period - 1) + gain.iloc[i]) / period
-            avg_loss.iloc[i] = (avg_loss.iloc[i-1] * (period - 1) + loss.iloc[i]) / period
+        # Apply Wilder's smoothing from period onwards
+        for i in range(period, len(prices)):
+            if not pd.isna(avg_gain.iloc[i-1]) and not pd.isna(gain.iloc[i]):
+                avg_gain.iloc[i] = (avg_gain.iloc[i-1] * (period - 1) + gain.iloc[i]) / period
+            
+            if not pd.isna(avg_loss.iloc[i-1]) and not pd.isna(loss.iloc[i]):
+                avg_loss.iloc[i] = (avg_loss.iloc[i-1] * (period - 1) + loss.iloc[i]) / period
         
+        # Calculate RS and RSI
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
+        
         return rsi
     
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -130,18 +137,28 @@ class XAUUSDBacktester:
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         """Generate crossover signals - RSI crossing SMA(RSI)"""
         df['Signal'] = 0
-        df['RSI_prev'] = df['RSI'].shift(1)
-        df['SMA_RSI_prev'] = df['SMA_RSI'].shift(1)
         
-        # Buy: RSI crosses ABOVE SMA(RSI) - from below to above
-        buy_signal = (df['RSI_prev'] < df['SMA_RSI_prev']) & (df['RSI'] > df['SMA_RSI'])
-        df.loc[buy_signal, 'Signal'] = 1
+        for i in range(1, len(df)):
+            # Skip if NaN values
+            if (pd.isna(df['RSI'].iloc[i]) or pd.isna(df['SMA_RSI'].iloc[i]) or
+                pd.isna(df['RSI'].iloc[i-1]) or pd.isna(df['SMA_RSI'].iloc[i-1])):
+                continue
+            
+            rsi_prev = df['RSI'].iloc[i-1]
+            sma_prev = df['SMA_RSI'].iloc[i-1]
+            rsi_curr = df['RSI'].iloc[i]
+            sma_curr = df['SMA_RSI'].iloc[i]
+            
+            # Buy: RSI crosses ABOVE SMA(RSI) - strict crossover
+            # Previous: RSI <= SMA, Current: RSI > SMA
+            if rsi_prev <= sma_prev and rsi_curr > sma_curr:
+                df.loc[df.index[i], 'Signal'] = 1
+            
+            # Sell: RSI crosses BELOW SMA(RSI) - strict crossover
+            # Previous: RSI >= SMA, Current: RSI < SMA
+            elif rsi_prev >= sma_prev and rsi_curr < sma_curr:
+                df.loc[df.index[i], 'Signal'] = -1
         
-        # Sell: RSI crosses BELOW SMA(RSI) - from above to below
-        sell_signal = (df['RSI_prev'] > df['SMA_RSI_prev']) & (df['RSI'] < df['SMA_RSI'])
-        df.loc[sell_signal, 'Signal'] = -1
-        
-        df = df.drop(['RSI_prev', 'SMA_RSI_prev'], axis=1)
         return df
     
     def get_exact_exit_price(self, entry_date, exit_date_str, trailing_stop_level):
@@ -526,13 +543,27 @@ def run_backtest(message):
         total_signals = buy_signals + sell_signals
         
         # Show debug info
-        if total_signals == 0:
-            debug_msg = f"⚠️ <b>Debug Info:</b>\n"
-            debug_msg += f"Candles: {len(df)}\n"
-            debug_msg += f"Buy signals: {buy_signals}\n"
-            debug_msg += f"Sell signals: {sell_signals}\n"
-            debug_msg += f"<i>No crossovers detected. May need longer period or different timeframe.</i>\n\n"
-            bot.send_message(chat_id, debug_msg, parse_mode='HTML')
+        debug_msg = f"<b>🔍 Debug Info:</b>\n"
+        debug_msg += f"Candles: {len(df)}\n"
+        debug_msg += f"Buy signals: {buy_signals}\n"
+        debug_msg += f"Sell signals: {sell_signals}\n"
+        debug_msg += f"Total signals: {total_signals}\n\n"
+        
+        if total_signals > 0:
+            # Show last few signals
+            signal_rows = df[df['Signal'] != 0].tail(5)
+            debug_msg += f"<b>Latest signals:</b>\n"
+            for idx, row in signal_rows.iterrows():
+                sig_type = "🟢 BUY" if row['Signal'] == 1 else "🔴 SELL"
+                debug_msg += f"{sig_type} {str(idx.date())}: RSI={row['RSI']:.2f} SMA={row['SMA_RSI']:.2f}\n"
+        else:
+            # Show RSI vs SMA stats
+            valid_df = df.dropna(subset=['RSI', 'SMA_RSI'])
+            debug_msg += f"RSI range: {valid_df['RSI'].min():.2f} - {valid_df['RSI'].max():.2f}\n"
+            debug_msg += f"SMA(RSI) range: {valid_df['SMA_RSI'].min():.2f} - {valid_df['SMA_RSI'].max():.2f}\n"
+            debug_msg += f"<i>No crossovers detected</i>\n"
+        
+        bot.send_message(chat_id, debug_msg, parse_mode='HTML')
         
         # Run backtest
         results, trades = backtester.run_backtest(df)
