@@ -128,23 +128,20 @@ class XAUUSDBacktester:
         return df
     
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Generate crossover signals"""
+        """Generate crossover signals - RSI crossing SMA(RSI)"""
         df['Signal'] = 0
+        df['RSI_prev'] = df['RSI'].shift(1)
+        df['SMA_RSI_prev'] = df['SMA_RSI'].shift(1)
         
-        for i in range(1, len(df)):
-            if pd.isna(df['RSI'].iloc[i]) or pd.isna(df['SMA_RSI'].iloc[i]):
-                continue
-            
-            # Buy: RSI crosses above SMA(RSI)
-            if (df['RSI'].iloc[i-1] <= df['SMA_RSI'].iloc[i-1] and 
-                df['RSI'].iloc[i] > df['SMA_RSI'].iloc[i]):
-                df.loc[df.index[i], 'Signal'] = 1
-            
-            # Sell: RSI crosses below SMA(RSI)
-            elif (df['RSI'].iloc[i-1] >= df['SMA_RSI'].iloc[i-1] and 
-                  df['RSI'].iloc[i] < df['SMA_RSI'].iloc[i]):
-                df.loc[df.index[i], 'Signal'] = -1
+        # Buy: RSI crosses ABOVE SMA(RSI) - from below to above
+        buy_signal = (df['RSI_prev'] < df['SMA_RSI_prev']) & (df['RSI'] > df['SMA_RSI'])
+        df.loc[buy_signal, 'Signal'] = 1
         
+        # Sell: RSI crosses BELOW SMA(RSI) - from above to below
+        sell_signal = (df['RSI_prev'] > df['SMA_RSI_prev']) & (df['RSI'] < df['SMA_RSI'])
+        df.loc[sell_signal, 'Signal'] = -1
+        
+        df = df.drop(['RSI_prev', 'SMA_RSI_prev'], axis=1)
         return df
     
     def get_exact_exit_price(self, entry_date, exit_date_str, trailing_stop_level):
@@ -168,7 +165,7 @@ class XAUUSDBacktester:
             return None
     
     def run_backtest(self, df: pd.DataFrame) -> Tuple[Dict, List]:
-        """Run backtest"""
+        """Run backtest with proper trailing stop logic"""
         results = {
             'total_trades': 0,
             'winning_trades': 0,
@@ -188,30 +185,45 @@ class XAUUSDBacktester:
             signal = df['Signal'].iloc[i]
             avg_change = df['Avg_Price_Change'].iloc[i]
             
-            # In position: check trailing stop
+            # In position: check sell signal OR trailing stop
             if self.position == 'long':
-                trailing_stop_level = current_price * (1 - (avg_change + self.trailing_stop_pct * 100) / 100)
+                # Calculate current trailing stop level
+                # Trailing stop = current price - (avg_change + x%) * current_price
+                stop_distance_pct = (avg_change + self.trailing_stop_pct * 100) / 100
+                trailing_stop_level = current_price * (1 - stop_distance_pct)
                 
-                # Check if stop loss hit on this candle
-                if df['Low'].iloc[i] <= trailing_stop_level:
-                    # Try to get exact minute-level exit price
+                # Exit if:
+                # 1. Sell signal (RSI crosses below SMA)
+                # 2. Price hits trailing stop (Low touches or goes below stop)
+                
+                exit_price = None
+                exit_type = None
+                
+                # Check sell signal first
+                if signal == -1:
+                    exit_price = current_price
+                    exit_type = 'sell_signal'
+                
+                # Check trailing stop
+                elif df['Low'].iloc[i] <= trailing_stop_level:
+                    # Try to get minute-level exit price
                     exit_date_str = str(current_date.date())
-                    exit_price = self.get_exact_exit_price(self.entry_date, exit_date_str, trailing_stop_level)
-                    
-                    # Use minute price if available, else use daily low
-                    if exit_price is None:
-                        exit_price = df['Low'].iloc[i]
-                    
+                    minute_exit = self.get_exact_exit_price(self.entry_date, exit_date_str, trailing_stop_level)
+                    exit_price = minute_exit if minute_exit else df['Low'].iloc[i]
+                    exit_type = 'trailing_stop'
+                
+                # Execute exit if triggered
+                if exit_price is not None:
                     pnl = (exit_price - self.entry_price) / self.entry_price
                     self.balance += self.initial_capital * pnl
                     
                     self.closed_trades.append({
                         'entry_date': str(self.entry_date.date()),
                         'entry_price': round(self.entry_price, 2),
-                        'exit_date': exit_date_str,
+                        'exit_date': exit_date_str if exit_type == 'trailing_stop' else str(current_date.date()),
                         'exit_price': round(exit_price, 2),
                         'pnl_pct': round(pnl * 100, 2),
-                        'type': 'trailing_stop'
+                        'type': exit_type
                     })
                     
                     self.position = None
@@ -221,32 +233,11 @@ class XAUUSDBacktester:
                     else:
                         results['losing_trades'] += 1
             
-            # Entry signal
-            if signal == 1 and self.position is None:
+            # Entry signal (only if not already in position)
+            elif signal == 1 and self.position is None:
                 self.position = 'long'
                 self.entry_price = current_price
                 self.entry_date = current_date
-            
-            # Exit signal
-            elif signal == -1 and self.position == 'long':
-                pnl = (current_price - self.entry_price) / self.entry_price
-                self.balance += self.initial_capital * pnl
-                
-                self.closed_trades.append({
-                    'entry_date': str(self.entry_date.date()),
-                    'entry_price': round(self.entry_price, 2),
-                    'exit_date': str(current_date.date()),
-                    'exit_price': round(current_price, 2),
-                    'pnl_pct': round(pnl * 100, 2),
-                    'type': 'sell_signal'
-                })
-                
-                self.position = None
-                results['total_trades'] += 1
-                if pnl > 0:
-                    results['winning_trades'] += 1
-                else:
-                    results['losing_trades'] += 1
             
             # Check blowup
             if self.balance <= 0:
@@ -295,14 +286,18 @@ def format_results(results: Dict, trades: List) -> str:
     if results['blowup']:
         msg += f"⚠️ <b>BLOWUP!</b> Date: <code>{results['blowup_date']}</code>\n\n"
     
-    # Add top trades
+    # Add trade details
     if trades:
-        msg += f"<b>📋 Recent Trades:</b>\n"
-        for trade in trades[-5:]:  # Last 5 trades
+        msg += f"<b>📋 All {len(trades)} Trades:</b>\n"
+        for trade in trades:
             sign = "✅" if trade['pnl_pct'] > 0 else "❌"
-            msg += f"{sign} {trade['entry_date']} → {trade['exit_date']}: "
+            exit_type = "📍TS" if trade['type'] == 'trailing_stop' else "🔴SL"
+            msg += f"{sign} {exit_type} {trade['entry_date']}→{trade['exit_date']}: "
             msg += f"<code>{trade['entry_price']:.2f}</code>→<code>{trade['exit_price']:.2f}</code> "
             msg += f"<code>{trade['pnl_pct']:+.2f}%</code>\n"
+    else:
+        msg += f"<b>ℹ️ No trades detected in this period</b>\n"
+        msg += f"(No RSI(14) crossover signals found)\n"
     
     return msg
 
@@ -524,6 +519,20 @@ def run_backtest(message):
         
         df = backtester.calculate_indicators(df)
         df = backtester.generate_signals(df)
+        
+        # Debug: count signals
+        buy_signals = (df['Signal'] == 1).sum()
+        sell_signals = (df['Signal'] == -1).sum()
+        total_signals = buy_signals + sell_signals
+        
+        # Show debug info
+        if total_signals == 0:
+            debug_msg = f"⚠️ <b>Debug Info:</b>\n"
+            debug_msg += f"Candles: {len(df)}\n"
+            debug_msg += f"Buy signals: {buy_signals}\n"
+            debug_msg += f"Sell signals: {sell_signals}\n"
+            debug_msg += f"<i>No crossovers detected. May need longer period or different timeframe.</i>\n\n"
+            bot.send_message(chat_id, debug_msg, parse_mode='HTML')
         
         # Run backtest
         results, trades = backtester.run_backtest(df)
