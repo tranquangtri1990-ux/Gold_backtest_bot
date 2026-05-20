@@ -160,95 +160,66 @@ class XAUUSDBacktester:
             print(f"fetch_minute_data error: {e}")
             return None
     
-    def calculate_rsi_wilder(self, prices: pd.Series, period: int = 14) -> pd.Series:
-        """Calculate RSI using Wilder's smoothing (TradingView method)"""
-        try:
-            # Ensure 1D Series
-            if len(prices.shape) > 1:
-                prices = prices.iloc[:, 0] if prices.shape[1] > 0 else prices.squeeze()
-            
-            # Use numpy for cleaner calculation
-            delta = prices.diff().values
-            gain = np.where(delta > 0, delta, 0.0)
-            loss = np.where(delta < 0, -delta, 0.0)
-            
-            avg_gain = np.zeros_like(gain, dtype=float)
-            avg_loss = np.zeros_like(loss, dtype=float)
-            
-            # Initialize first average with simple MA
-            if period < len(gain):
-                avg_gain[period] = np.mean(gain[1:period+1])
-                avg_loss[period] = np.mean(loss[1:period+1])
-            
-            # Wilder's smoothing
-            for i in range(period + 1, len(gain)):
-                avg_gain[i] = (avg_gain[i-1] * (period - 1) + gain[i]) / period
-                avg_loss[i] = (avg_loss[i-1] * (period - 1) + loss[i]) / period
-            
-            # Calculate RSI safely
-            rs = np.divide(avg_gain, avg_loss, where=avg_loss!=0, out=np.zeros_like(avg_gain))
-            rsi = 100 - (100 / (1 + rs))
-            
-            return pd.Series(rsi, index=prices.index)
-        except Exception as e:
-            # Return empty Series on error
-            return pd.Series(np.nan, index=prices.index)
-    
-    def smma(self, series: pd.Series, period: int) -> pd.Series:
-        """Smoothed Moving Average (same as weeklyscan.py)"""
-        values = series.values.astype(float)
-        result = np.full(len(values), np.nan)
-        count, start = 0, -1
-        
-        # Find first non-NaN value
-        for i, v in enumerate(values):
-            if not np.isnan(v):
-                count += 1
-                if count == period:
-                    start = i
-                    break
-            else:
-                count = 0
-        
-        if start == -1:
-            return pd.Series(result, index=series.index)
-        
-        # Initialize with simple average
-        result[start] = np.mean(values[start - period + 1: start + 1])
-        
-        # Apply SMMA smoothing
-        for i in range(start + 1, len(values)):
-            if not np.isnan(values[i]):
-                result[i] = (result[i-1] * (period - 1) + values[i]) / period
-            else:
-                result[i] = result[i-1]
-        
-        return pd.Series(result, index=series.index)
-    
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate indicators - khớp TradingView RSI(14) SMMA + SMA(RSI,14)"""
+        """
+        Tính RSI(14) Wilder + SMA(RSI,14) — khớp chính xác TradingView.
+
+        TradingView Pine Script tương đương:
+            rsi    = ta.rsi(close, 14)        // dùng RMA (Wilder smoothing)
+            signal = ta.sma(rsi, 14)
+
+        Công thức RMA (Wilder):
+            seed  = mean(gain[1..14])          // bar 1-14, bỏ bar 0 (NaN diff)
+            rma_i = (rma_{i-1} * 13 + gain_i) / 14
+        """
         df = df.copy()
+        period = 14
 
-        # RSI Wilder (RMA/SMMA) — dùng clip() để giữ NaN tại bar 0
-        # where(delta>0, 0.0) biến NaN thành 0 → seed SMMA sai → RSI lệch
-        delta = df['Close'].diff()
-        gain  = delta.clip(lower=0)       # NaN giữ nguyên, âm → 0
-        loss  = (-delta).clip(lower=0)    # NaN giữ nguyên, dương → 0
+        # --- Bước 1: tính gain/loss ---
+        # .diff() → bar 0 = NaN, bar 1 trở đi có giá trị
+        # KHÔNG dùng np.where hay .where() vì cả hai biến NaN thành 0 khi NaN>0=False
+        # Dùng clip() để NaN được giữ nguyên, chỉ flip dấu âm về 0
+        close = df['Close'].squeeze()   # đảm bảo 1-D Series
+        delta = close.diff()
+        gain  = delta.clip(lower=0)     # âm → 0, NaN → NaN
+        loss  = (-delta).clip(lower=0)  # dương → 0, NaN → NaN
 
-        avg_gain = self.smma(gain, 14)
-        avg_loss = self.smma(loss, 14)
+        # Convert sang numpy để loop nhanh
+        g = gain.values.astype(float)   # g[0] = NaN (từ diff)
+        l = loss.values.astype(float)
+        n = len(g)
 
-        # Tránh chia 0: avg_loss=0 → RSI=100
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        df['RSI'] = 100 - (100 / (1 + rs))
-        df.loc[avg_loss == 0, 'RSI'] = 100.0
+        avg_g = np.full(n, np.nan)
+        avg_l = np.full(n, np.nan)
 
-        # SMA(RSI, 14) — khớp ta.sma TradingView
-        df['SMA_RSI'] = df['RSI'].rolling(window=14, min_periods=14).mean()
+        # --- Bước 2: seed tại bar 14 (index 14) ---
+        # TradingView seed = SMA của 14 giá trị đầu tiên CÓ dữ liệu
+        # Vì g[0]=NaN, 14 giá trị đầu tiên hợp lệ là g[1]..g[14]
+        if n > period:
+            avg_g[period] = np.nanmean(g[1 : period + 1])
+            avg_l[period] = np.nanmean(l[1 : period + 1])
+
+            # --- Bước 3: Wilder smoothing từ bar 15 trở đi ---
+            for i in range(period + 1, n):
+                avg_g[i] = (avg_g[i-1] * (period - 1) + g[i]) / period
+                avg_l[i] = (avg_l[i-1] * (period - 1) + l[i]) / period
+
+        # --- Bước 4: RSI ---
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rs = np.where(avg_l == 0, np.inf, avg_g / avg_l)
+        rsi_vals = np.where(avg_l == 0, 100.0, 100.0 - 100.0 / (1.0 + rs))
+        # Bar 0..13 vẫn là NaN (chưa đủ data để seed)
+        rsi_vals[:period] = np.nan
+
+        df['RSI'] = pd.Series(rsi_vals, index=df.index)
+
+        # --- Bước 5: SMA(RSI, 14) — ta.sma trong TradingView ---
+        df['SMA_RSI'] = df['RSI'].rolling(window=period, min_periods=period).mean()
 
         # Avg price change cho trailing stop
-        df['Price_Change_Pct'] = df['Close'].pct_change().abs() * 100
-        df['Avg_Price_Change']  = df['Price_Change_Pct'].rolling(window=self.n_periods).mean()
+        df['Price_Change_Pct'] = close.pct_change().abs() * 100
+        df['Avg_Price_Change']  = df['Price_Change_Pct'].rolling(
+            window=self.n_periods, min_periods=1).mean()
 
         return df
     
