@@ -5,7 +5,6 @@ Stores params via /phiên, /vốn, /timeframe, /time_start, /time_end, /x%
 Backtests on higher timeframe, validates exit at minute level
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -14,6 +13,14 @@ import os
 import json
 import threading
 from typing import Dict, Optional, Tuple, List
+
+# tvdatafeed: pull data trực tiếp từ TradingView (cùng nguồn OANDA XAUUSD)
+try:
+    from tvDatafeed import TvDatafeed, Interval
+    _TV_AVAILABLE = True
+except ImportError:
+    _TV_AVAILABLE = False
+    print("Warning: tvDatafeed not installed. Run: pip install tvdatafeed")
 
 # Initialize Telegram bot
 TELEGRAM_API_KEY = os.getenv('TELEGRAM_BT_VangDo_bot_API')
@@ -72,46 +79,94 @@ class XAUUSDBacktester:
         return None
     
     def fetch_data(self) -> Optional[pd.DataFrame]:
-        """Fetch XAU/USD data"""
+        """
+        Fetch XAUUSD từ TradingView qua tvdatafeed (OANDA:XAUUSD).
+        Cùng nguồn dữ liệu với TradingView → RSI khớp 100%.
+        """
+        if not _TV_AVAILABLE:
+            print("tvDatafeed not available. Run: pip install tvdatafeed")
+            return None
+
+        interval_map = {
+            'd': Interval.in_daily,
+            'w': Interval.in_weekly,
+            'm': Interval.in_monthly,
+        }
+        tv_interval = interval_map.get(self.timeframe, Interval.in_daily)
+
         try:
-            df = yf.download('GC=F', start=self.start_date, end=self.end_date,
-                           interval=self.interval, progress=False, auto_adjust=True)
-            if df.empty:
+            start_dt = datetime.strptime(self.start_date, '%Y-%m-%d')
+            days_diff = (datetime.now() - start_dt).days + 60
+
+            if self.timeframe == 'w':
+                n_bars = max(300, days_diff // 7 + 60)
+            elif self.timeframe == 'm':
+                n_bars = max(120, days_diff // 30 + 24)
+            else:
+                n_bars = max(500, days_diff + 60)
+
+            tv = TvDatafeed()  # anonymous, không cần login
+            df = tv.get_hist(
+                symbol='XAUUSD',
+                exchange='OANDA',      # spot gold — đúng nguồn TradingView
+                interval=tv_interval,
+                n_bars=n_bars,
+            )
+
+            if df is None or df.empty:
+                print("tvdatafeed: no data returned")
                 return None
-            # yfinance >= 0.2.38 trả MultiIndex ('Close','GC=F') → flatten
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
+
+            # tvdatafeed trả cột lowercase: open, high, low, close, volume
+            df.columns = [c.capitalize() for c in df.columns]
             df = df[['Close', 'High', 'Low', 'Volume']].copy()
-            # Ensure each column is plain 1-D Series
-            for col in df.columns:
-                df[col] = df[col].squeeze()
+
+            # Lọc theo date range
+            df.index = pd.to_datetime(df.index)
+            start_ts = pd.Timestamp(self.start_date)
+            end_ts   = pd.Timestamp(self.end_date) if self.end_date else pd.Timestamp.now()
+            df = df[(df.index >= start_ts) & (df.index <= end_ts)]
+
+            if df.empty:
+                print("No data in selected date range")
+                return None
+
+            df = df.sort_index()
             df.index.name = 'Date'
+            print(f"Fetched {len(df)} bars | OANDA:XAUUSD {self.timeframe.upper()}")
             return df
+
         except Exception as e:
             print(f"fetch_data error: {e}")
             return None
     
     def fetch_minute_data(self, date_str: str) -> Optional[pd.DataFrame]:
-        """Fetch 1-minute data for a specific date to find exact exit price"""
-        try:
-            # Parse date
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-            start = date_obj.strftime('%Y-%m-%d')
-            end = (date_obj + timedelta(days=1)).strftime('%Y-%m-%d')
-            
-            # Fetch minute data
-            df = yf.download('GC=F', start=start, end=end, interval='1m', progress=False)
-            if df.empty:
-                return None
-            
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)  # giữ tên field, bỏ ticker
-            
-            # Select only needed columns
-            if 'Close' in df.columns and 'Low' in df.columns:
-                return df[['Close', 'Low']]
+        """Fetch 1-minute data từ TradingView để tìm giá exit chính xác"""
+        if not _TV_AVAILABLE:
             return None
-        except:
+        try:
+            tv = TvDatafeed()
+            df = tv.get_hist(
+                symbol='XAUUSD',
+                exchange='OANDA',
+                interval=Interval.in_1_minute,
+                n_bars=480,  # ~8 giờ trading
+            )
+            if df is None or df.empty:
+                return None
+
+            df.columns = [c.capitalize() for c in df.columns]
+            if 'Close' not in df.columns or 'Low' not in df.columns:
+                return None
+
+            # Lọc đúng ngày cần
+            df.index = pd.to_datetime(df.index)
+            day_ts = pd.Timestamp(date_str)
+            df = df[df.index.date == day_ts.date()]
+
+            return df[['Close', 'Low']] if not df.empty else None
+        except Exception as e:
+            print(f"fetch_minute_data error: {e}")
             return None
     
     def calculate_rsi_wilder(self, prices: pd.Series, period: int = 14) -> pd.Series:
@@ -180,30 +235,29 @@ class XAUUSDBacktester:
         return pd.Series(result, index=series.index)
     
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate indicators - khớp với TradingView RSI(14) + SMA(RSI,14)"""
+        """Calculate indicators - khớp TradingView RSI(14) SMMA + SMA(RSI,14)"""
         df = df.copy()
 
-        # --- RSI Wilder (RMA / SMMA) ---
-        # QUAN TRỌNG: dùng clip() thay where() để NaN tại bar 0 được giữ nguyên.
-        # where(delta > 0, 0.0) biến NaN thành 0 vì NaN > 0 == False → seed SMMA sai.
+        # RSI Wilder (RMA/SMMA) — dùng clip() để giữ NaN tại bar 0
+        # where(delta>0, 0.0) biến NaN thành 0 → seed SMMA sai → RSI lệch
         delta = df['Close'].diff()
-        gain = delta.clip(lower=0)          # NaN giữ nguyên, âm → 0
-        loss = (-delta).clip(lower=0)       # NaN giữ nguyên, dương → 0
+        gain  = delta.clip(lower=0)       # NaN giữ nguyên, âm → 0
+        loss  = (-delta).clip(lower=0)    # NaN giữ nguyên, dương → 0
 
         avg_gain = self.smma(gain, 14)
         avg_loss = self.smma(loss, 14)
 
-        # Tránh chia 0: khi avg_loss == 0, RSI = 100
+        # Tránh chia 0: avg_loss=0 → RSI=100
         rs = avg_gain / avg_loss.replace(0, np.nan)
         df['RSI'] = 100 - (100 / (1 + rs))
         df.loc[avg_loss == 0, 'RSI'] = 100.0
 
-        # SMA(RSI, 14) — khớp với ta.sma trong TradingView
+        # SMA(RSI, 14) — khớp ta.sma TradingView
         df['SMA_RSI'] = df['RSI'].rolling(window=14, min_periods=14).mean()
 
         # Avg price change cho trailing stop
         df['Price_Change_Pct'] = df['Close'].pct_change().abs() * 100
-        df['Avg_Price_Change'] = df['Price_Change_Pct'].rolling(window=self.n_periods).mean()
+        df['Avg_Price_Change']  = df['Price_Change_Pct'].rolling(window=self.n_periods).mean()
 
         return df
     
@@ -524,12 +578,11 @@ def set_start_date(message):
         parsed = None
         for fmt in ('%d/%m/%Y', '%d/%m/%y'):
             try:
-                parsed = datetime.strptime(date_str, fmt)
-                break
+                parsed = datetime.strptime(date_str, fmt); break
             except ValueError:
                 continue
         if not parsed:
-            bot.send_message(message.chat.id, "❌ Invalid date format (use dd/mm/yyyy, e.g. 01/01/2023)")
+            bot.send_message(message.chat.id, "❌ Sai format ngày (dùng dd/mm/yyyy, ví dụ: 01/01/2023)")
             return
         USER_PARAMS['start_date'] = date_str
         bot.send_message(message.chat.id, f"✅ Start date set to <code>{date_str}</code>", parse_mode='HTML')
@@ -549,12 +602,11 @@ def set_end_date(message):
         parsed = None
         for fmt in ('%d/%m/%Y', '%d/%m/%y'):
             try:
-                parsed = datetime.strptime(date_str, fmt)
-                break
+                parsed = datetime.strptime(date_str, fmt); break
             except ValueError:
                 continue
         if not parsed:
-            bot.send_message(message.chat.id, "❌ Invalid date format (use dd/mm/yyyy, e.g. 10/05/2026)")
+            bot.send_message(message.chat.id, "❌ Sai format ngày (dùng dd/mm/yyyy, ví dụ: 10/05/2026)")
             return
         USER_PARAMS['end_date'] = date_str
         bot.send_message(message.chat.id, f"✅ End date set to <code>{date_str}</code>", parse_mode='HTML')
