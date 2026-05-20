@@ -95,35 +95,51 @@ class XAUUSDBacktester:
             df = yf.download('GC=F', start=start, end=end, interval='1m', progress=False)
             if df.empty:
                 return None
-            return df[['Close', 'High', 'Low']]
+            
+            # Ensure columns are clean
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(0)
+            
+            # Select only needed columns
+            if 'Close' in df.columns and 'Low' in df.columns:
+                return df[['Close', 'Low']]
+            return None
         except:
             return None
     
     def calculate_rsi_wilder(self, prices: pd.Series, period: int = 14) -> pd.Series:
         """Calculate RSI using Wilder's smoothing (TradingView method)"""
-        # Use numpy for cleaner calculation
-        delta = prices.diff().values
-        gain = np.where(delta > 0, delta, 0.0)
-        loss = np.where(delta < 0, -delta, 0.0)
-        
-        avg_gain = np.zeros_like(gain, dtype=float)
-        avg_loss = np.zeros_like(loss, dtype=float)
-        
-        # Initialize first average with simple MA
-        if period < len(gain):
-            avg_gain[period] = np.mean(gain[1:period+1])
-            avg_loss[period] = np.mean(loss[1:period+1])
-        
-        # Wilder's smoothing
-        for i in range(period + 1, len(gain)):
-            avg_gain[i] = (avg_gain[i-1] * (period - 1) + gain[i]) / period
-            avg_loss[i] = (avg_loss[i-1] * (period - 1) + loss[i]) / period
-        
-        # Calculate RSI safely
-        rs = np.divide(avg_gain, avg_loss, where=avg_loss!=0, out=np.zeros_like(avg_gain))
-        rsi = 100 - (100 / (1 + rs))
-        
-        return pd.Series(rsi, index=prices.index)
+        try:
+            # Ensure 1D Series
+            if len(prices.shape) > 1:
+                prices = prices.iloc[:, 0] if prices.shape[1] > 0 else prices.squeeze()
+            
+            # Use numpy for cleaner calculation
+            delta = prices.diff().values
+            gain = np.where(delta > 0, delta, 0.0)
+            loss = np.where(delta < 0, -delta, 0.0)
+            
+            avg_gain = np.zeros_like(gain, dtype=float)
+            avg_loss = np.zeros_like(loss, dtype=float)
+            
+            # Initialize first average with simple MA
+            if period < len(gain):
+                avg_gain[period] = np.mean(gain[1:period+1])
+                avg_loss[period] = np.mean(loss[1:period+1])
+            
+            # Wilder's smoothing
+            for i in range(period + 1, len(gain)):
+                avg_gain[i] = (avg_gain[i-1] * (period - 1) + gain[i]) / period
+                avg_loss[i] = (avg_loss[i-1] * (period - 1) + loss[i]) / period
+            
+            # Calculate RSI safely
+            rs = np.divide(avg_gain, avg_loss, where=avg_loss!=0, out=np.zeros_like(avg_gain))
+            rsi = 100 - (100 / (1 + rs))
+            
+            return pd.Series(rsi, index=prices.index)
+        except Exception as e:
+            # Return empty Series on error
+            return pd.Series(np.nan, index=prices.index)
     
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate indicators"""
@@ -138,23 +154,24 @@ class XAUUSDBacktester:
         df['Signal'] = 0
         
         for i in range(1, len(df)):
-            # Skip if NaN values
-            if (pd.isna(df['RSI'].iloc[i]) or pd.isna(df['SMA_RSI'].iloc[i]) or
-                pd.isna(df['RSI'].iloc[i-1]) or pd.isna(df['SMA_RSI'].iloc[i-1])):
-                continue
-            
+            # Get values safely
             rsi_prev = df['RSI'].iloc[i-1]
             sma_prev = df['SMA_RSI'].iloc[i-1]
             rsi_curr = df['RSI'].iloc[i]
             sma_curr = df['SMA_RSI'].iloc[i]
             
-            # Buy: RSI crosses ABOVE SMA(RSI) - strict crossover
-            # Previous: RSI <= SMA, Current: RSI > SMA
+            # Skip if any NaN
+            try:
+                if np.isnan(rsi_prev) or np.isnan(sma_prev) or np.isnan(rsi_curr) or np.isnan(sma_curr):
+                    continue
+            except:
+                continue
+            
+            # Buy: RSI crosses ABOVE SMA(RSI)
             if rsi_prev <= sma_prev and rsi_curr > sma_curr:
                 df.loc[df.index[i], 'Signal'] = 1
             
-            # Sell: RSI crosses BELOW SMA(RSI) - strict crossover
-            # Previous: RSI >= SMA, Current: RSI < SMA
+            # Sell: RSI crosses BELOW SMA(RSI)
             elif rsi_prev >= sma_prev and rsi_curr < sma_curr:
                 df.loc[df.index[i], 'Signal'] = -1
         
