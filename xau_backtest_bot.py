@@ -14,13 +14,7 @@ import json
 import threading
 from typing import Dict, Optional, Tuple, List
 
-# tvdatafeed: pull data trực tiếp từ TradingView (cùng nguồn OANDA XAUUSD)
-try:
-    from tvDatafeed import TvDatafeed, Interval
-    _TV_AVAILABLE = True
-except ImportError:
-    _TV_AVAILABLE = False
-    print("Warning: tvDatafeed not installed. Run: pip install tvdatafeed")
+import yfinance as yf
 
 # Initialize Telegram bot
 TELEGRAM_API_KEY = os.getenv('TELEGRAM_BT_VangDo_bot_API')
@@ -80,60 +74,35 @@ class XAUUSDBacktester:
     
     def fetch_data(self) -> Optional[pd.DataFrame]:
         """
-        Fetch XAUUSD từ TradingView qua tvdatafeed (OANDA:XAUUSD).
-        Cùng nguồn dữ liệu với TradingView → RSI khớp 100%.
+        Fetch XAUUSD Spot từ Yahoo Finance (XAUUSD=X).
+        Đây là giá spot gold USD/oz — khớp với OANDA:XAUUSD trên TradingView,
+        khác với GC=F (futures COMEX) đã dùng trước đây.
         """
-        if not _TV_AVAILABLE:
-            print("tvDatafeed not available. Run: pip install tvdatafeed")
-            return None
-
-        interval_map = {
-            'd': Interval.in_daily,
-            'w': Interval.in_weekly,
-            'm': Interval.in_monthly,
-        }
-        tv_interval = interval_map.get(self.timeframe, Interval.in_daily)
-
         try:
-            start_dt = datetime.strptime(self.start_date, '%Y-%m-%d')
-            days_diff = (datetime.now() - start_dt).days + 60
-
-            if self.timeframe == 'w':
-                n_bars = max(300, days_diff // 7 + 60)
-            elif self.timeframe == 'm':
-                n_bars = max(120, days_diff // 30 + 24)
-            else:
-                n_bars = max(500, days_diff + 60)
-
-            tv = TvDatafeed()  # anonymous, không cần login
-            df = tv.get_hist(
-                symbol='XAUUSD',
-                exchange='OANDA',      # spot gold — đúng nguồn TradingView
-                interval=tv_interval,
-                n_bars=n_bars,
+            df = yf.download(
+                'XAUUSD=X',
+                start=self.start_date,
+                end=self.end_date,
+                interval=self.interval,
+                progress=False,
+                auto_adjust=True,
             )
-
-            if df is None or df.empty:
-                print("tvdatafeed: no data returned")
-                return None
-
-            # tvdatafeed trả cột lowercase: open, high, low, close, volume
-            df.columns = [c.capitalize() for c in df.columns]
-            df = df[['Close', 'High', 'Low', 'Volume']].copy()
-
-            # Lọc theo date range
-            df.index = pd.to_datetime(df.index)
-            start_ts = pd.Timestamp(self.start_date)
-            end_ts   = pd.Timestamp(self.end_date) if self.end_date else pd.Timestamp.now()
-            df = df[(df.index >= start_ts) & (df.index <= end_ts)]
-
             if df.empty:
-                print("No data in selected date range")
+                print("yfinance: no data for XAUUSD=X")
                 return None
 
+            # Flatten MultiIndex columns (yfinance >= 0.2.38)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+
+            df = df[['Close', 'High', 'Low', 'Volume']].copy()
+            for col in df.columns:
+                df[col] = df[col].squeeze()
+
+            df = df.dropna(subset=['Close'])
             df = df.sort_index()
             df.index.name = 'Date'
-            print(f"Fetched {len(df)} bars | OANDA:XAUUSD {self.timeframe.upper()}")
+            print(f"Fetched {len(df)} bars | XAUUSD=X (spot) {self.timeframe.upper()}")
             return df
 
         except Exception as e:
@@ -141,30 +110,28 @@ class XAUUSDBacktester:
             return None
     
     def fetch_minute_data(self, date_str: str) -> Optional[pd.DataFrame]:
-        """Fetch 1-minute data từ TradingView để tìm giá exit chính xác"""
-        if not _TV_AVAILABLE:
-            return None
+        """Fetch 1-minute XAUUSD=X để tìm giá exit chính xác trong ngày"""
         try:
-            tv = TvDatafeed()
-            df = tv.get_hist(
-                symbol='XAUUSD',
-                exchange='OANDA',
-                interval=Interval.in_1_minute,
-                n_bars=480,  # ~8 giờ trading
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            start = date_obj.strftime('%Y-%m-%d')
+            end   = (date_obj + timedelta(days=1)).strftime('%Y-%m-%d')
+
+            df = yf.download(
+                'XAUUSD=X',
+                start=start, end=end,
+                interval='1m',
+                progress=False,
+                auto_adjust=True,
             )
-            if df is None or df.empty:
+            if df.empty:
                 return None
 
-            df.columns = [c.capitalize() for c in df.columns]
-            if 'Close' not in df.columns or 'Low' not in df.columns:
-                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
 
-            # Lọc đúng ngày cần
-            df.index = pd.to_datetime(df.index)
-            day_ts = pd.Timestamp(date_str)
-            df = df[df.index.date == day_ts.date()]
-
-            return df[['Close', 'Low']] if not df.empty else None
+            if 'Close' in df.columns and 'Low' in df.columns:
+                return df[['Close', 'Low']]
+            return None
         except Exception as e:
             print(f"fetch_minute_data error: {e}")
             return None
