@@ -63,11 +63,10 @@ class XAUUSDBacktester:
         
     @staticmethod
     def _parse_date(date_str: str) -> str:
-        """Parse dd/mm/yyyy to yyyy-mm-dd"""
+        """Parse dd/mm/yyyy hoặc dd/mm/yy → yyyy-mm-dd"""
         for fmt in ('%d/%m/%Y', '%d/%m/%y'):
             try:
-                date_obj = datetime.strptime(date_str, fmt)
-                return date_obj.strftime('%Y-%m-%d')
+                return datetime.strptime(date_str, fmt).strftime('%Y-%m-%d')
             except ValueError:
                 continue
         return None
@@ -79,15 +78,13 @@ class XAUUSDBacktester:
                            interval=self.interval, progress=False, auto_adjust=True)
             if df.empty:
                 return None
-            # Fix: newer yfinance returns MultiIndex columns like ('Close', 'GC=F')
-            # Flatten to single-level ('Close', 'High', ...) before further use
+            # yfinance >= 0.2.38 trả MultiIndex ('Close','GC=F') → flatten
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             df = df[['Close', 'High', 'Low', 'Volume']].copy()
-            # Ensure all columns are 1D Series (not nested DataFrames)
+            # Ensure each column is plain 1-D Series
             for col in df.columns:
-                if hasattr(df[col], 'squeeze'):
-                    df[col] = df[col].squeeze()
+                df[col] = df[col].squeeze()
             df.index.name = 'Date'
             return df
         except Exception as e:
@@ -107,9 +104,8 @@ class XAUUSDBacktester:
             if df.empty:
                 return None
             
-            # Fix: droplevel(1) drops ticker 'GC=F', keeping field names ('Close', 'Low', ...)
             if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
+                df.columns = df.columns.droplevel(1)  # giữ tên field, bỏ ticker
             
             # Select only needed columns
             if 'Close' in df.columns and 'Low' in df.columns:
@@ -184,27 +180,31 @@ class XAUUSDBacktester:
         return pd.Series(result, index=series.index)
     
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate indicators - same as weeklyscan.py"""
+        """Calculate indicators - khớp với TradingView RSI(14) + SMA(RSI,14)"""
         df = df.copy()
-        
-        # RSI using SMMA
+
+        # --- RSI Wilder (RMA / SMMA) ---
+        # QUAN TRỌNG: dùng clip() thay where() để NaN tại bar 0 được giữ nguyên.
+        # where(delta > 0, 0.0) biến NaN thành 0 vì NaN > 0 == False → seed SMMA sai.
         delta = df['Close'].diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta).where(delta < 0, 0.0)
-        
+        gain = delta.clip(lower=0)          # NaN giữ nguyên, âm → 0
+        loss = (-delta).clip(lower=0)       # NaN giữ nguyên, dương → 0
+
         avg_gain = self.smma(gain, 14)
         avg_loss = self.smma(loss, 14)
-        
-        rs = avg_gain / avg_loss
+
+        # Tránh chia 0: khi avg_loss == 0, RSI = 100
+        rs = avg_gain / avg_loss.replace(0, np.nan)
         df['RSI'] = 100 - (100 / (1 + rs))
-        
-        # SMA of RSI
-        df['SMA_RSI'] = df['RSI'].rolling(14).mean()
-        
-        # Avg price change for trailing stop
+        df.loc[avg_loss == 0, 'RSI'] = 100.0
+
+        # SMA(RSI, 14) — khớp với ta.sma trong TradingView
+        df['SMA_RSI'] = df['RSI'].rolling(window=14, min_periods=14).mean()
+
+        # Avg price change cho trailing stop
         df['Price_Change_Pct'] = df['Close'].pct_change().abs() * 100
         df['Avg_Price_Change'] = df['Price_Change_Pct'].rolling(window=self.n_periods).mean()
-        
+
         return df
     
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -521,7 +521,6 @@ def set_start_date(message):
             return
         
         date_str = args[1]
-        # Accept both dd/mm/yyyy and dd/mm/yy
         parsed = None
         for fmt in ('%d/%m/%Y', '%d/%m/%y'):
             try:
@@ -547,7 +546,6 @@ def set_end_date(message):
             return
         
         date_str = args[1]
-        # Accept both dd/mm/yyyy and dd/mm/yy
         parsed = None
         for fmt in ('%d/%m/%Y', '%d/%m/%y'):
             try:
