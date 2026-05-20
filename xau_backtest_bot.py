@@ -101,30 +101,29 @@ class XAUUSDBacktester:
     
     def calculate_rsi_wilder(self, prices: pd.Series, period: int = 14) -> pd.Series:
         """Calculate RSI using Wilder's smoothing (TradingView method)"""
-        # Calculate price changes
-        delta = prices.diff()
+        # Use numpy for cleaner calculation
+        delta = prices.diff().values
+        gain = np.where(delta > 0, delta, 0.0)
+        loss = np.where(delta < 0, -delta, 0.0)
         
-        # Separate gains and losses
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
+        avg_gain = np.zeros_like(gain, dtype=float)
+        avg_loss = np.zeros_like(loss, dtype=float)
         
-        # Initialize average gain/loss with simple moving average
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
+        # Initialize first average with simple MA
+        if period < len(gain):
+            avg_gain[period] = np.mean(gain[1:period+1])
+            avg_loss[period] = np.mean(loss[1:period+1])
         
-        # Apply Wilder's smoothing from period onwards
-        for i in range(period, len(prices)):
-            if not pd.isna(avg_gain.iloc[i-1]) and not pd.isna(gain.iloc[i]):
-                avg_gain.iloc[i] = (avg_gain.iloc[i-1] * (period - 1) + gain.iloc[i]) / period
-            
-            if not pd.isna(avg_loss.iloc[i-1]) and not pd.isna(loss.iloc[i]):
-                avg_loss.iloc[i] = (avg_loss.iloc[i-1] * (period - 1) + loss.iloc[i]) / period
+        # Wilder's smoothing
+        for i in range(period + 1, len(gain)):
+            avg_gain[i] = (avg_gain[i-1] * (period - 1) + gain[i]) / period
+            avg_loss[i] = (avg_loss[i-1] * (period - 1) + loss[i]) / period
         
-        # Calculate RS and RSI
-        rs = avg_gain / avg_loss
+        # Calculate RSI safely
+        rs = np.divide(avg_gain, avg_loss, where=avg_loss!=0, out=np.zeros_like(avg_gain))
         rsi = 100 - (100 / (1 + rs))
         
-        return rsi
+        return pd.Series(rsi, index=prices.index)
     
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate indicators"""
