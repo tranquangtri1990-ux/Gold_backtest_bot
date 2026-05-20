@@ -74,40 +74,64 @@ class XAUUSDBacktester:
     
     def fetch_data(self) -> Optional[pd.DataFrame]:
         """
-        Fetch XAUUSD Spot từ Yahoo Finance (XAUUSD=X).
-        Đây là giá spot gold USD/oz — khớp với OANDA:XAUUSD trên TradingView,
-        khác với GC=F (futures COMEX) đã dùng trước đây.
+        Fetch XAUUSD data với fallback chain:
+          1. XAUUSD=X  — spot gold, gần nhất với OANDA:XAUUSD trên TradingView
+          2. GC=F      — Gold Futures COMEX, fallback nếu spot không có dữ liệu
         """
-        try:
-            df = yf.download(
-                'XAUUSD=X',
-                start=self.start_date,
-                end=self.end_date,
-                interval=self.interval,
-                progress=False,
-                auto_adjust=True,
-            )
-            if df.empty:
-                print("yfinance: no data for XAUUSD=X")
-                return None
+        # Ticker ưu tiên: spot trước, futures sau
+        tickers = [('XAUUSD=X', 'Spot'), ('GC=F', 'Futures fallback')]
 
-            # Flatten MultiIndex columns (yfinance >= 0.2.38)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
+        for ticker, label in tickers:
+            try:
+                print(f"Trying {ticker} ({label})...")
+                df = yf.download(
+                    ticker,
+                    start=self.start_date,
+                    end=self.end_date,
+                    interval=self.interval,
+                    progress=False,
+                    auto_adjust=True,
+                )
+                if df is None or df.empty:
+                    print(f"  → Empty response for {ticker}")
+                    continue
 
-            df = df[['Close', 'High', 'Low', 'Volume']].copy()
-            for col in df.columns:
-                df[col] = df[col].squeeze()
+                # Flatten MultiIndex columns (yfinance >= 0.2.38)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.droplevel(1)
 
-            df = df.dropna(subset=['Close'])
-            df = df.sort_index()
-            df.index.name = 'Date'
-            print(f"Fetched {len(df)} bars | XAUUSD=X (spot) {self.timeframe.upper()}")
-            return df
+                # Kiểm tra đủ cột cần thiết
+                missing = [c for c in ['Close', 'High', 'Low'] if c not in df.columns]
+                if missing:
+                    print(f"  → Missing columns {missing} for {ticker}")
+                    continue
 
-        except Exception as e:
-            print(f"fetch_data error: {e}")
-            return None
+                # Volume không bắt buộc với spot forex
+                if 'Volume' not in df.columns:
+                    df['Volume'] = 0
+
+                df = df[['Close', 'High', 'Low', 'Volume']].copy()
+                for col in df.columns:
+                    df[col] = df[col].squeeze()
+
+                df = df.dropna(subset=['Close'])
+                df = df.sort_index()
+                df.index.name = 'Date'
+
+                if df.empty:
+                    print(f"  → All NaN after dropna for {ticker}")
+                    continue
+
+                print(f"  ✓ Fetched {len(df)} bars | {ticker} ({label}) {self.timeframe.upper()}")
+                print(f"  Date range: {df.index[0].date()} → {df.index[-1].date()}")
+                return df
+
+            except Exception as e:
+                print(f"  → Error for {ticker}: {e}")
+                continue
+
+        print("fetch_data: all tickers failed")
+        return None
     
     def fetch_minute_data(self, date_str: str) -> Optional[pd.DataFrame]:
         """Fetch 1-minute XAUUSD=X để tìm giá exit chính xác trong ngày"""
@@ -642,7 +666,16 @@ def run_backtest(message):
         # Fetch and process data
         df = backtester.fetch_data()
         if df is None or df.empty:
-            bot.send_message(chat_id, "❌ Cannot fetch data. Check date range.")
+            bot.send_message(
+                chat_id,
+                f"❌ <b>Cannot fetch data</b>\n"
+                f"Timeframe: <code>{USER_PARAMS['timeframe']}</code>\n"
+                f"Start: <code>{USER_PARAMS['start_date']}</code>\n"
+                f"End: <code>{USER_PARAMS['end_date'] or 'today'}</code>\n"
+                f"\nThử: XAUUSD=X và GC=F đều không có data.\n"
+                f"Kiểm tra lại ngày — yfinance không có daily data tương lai.",
+                parse_mode='HTML'
+            )
             return
         
         df = backtester.calculate_indicators(df)
