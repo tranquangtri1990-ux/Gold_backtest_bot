@@ -15,6 +15,10 @@ import threading
 from typing import Dict, Optional, Tuple, List
 
 import yfinance as yf
+try:
+    import pandas_datareader
+except ImportError:
+    pandas_datareader = None
 
 # Initialize Telegram bot
 TELEGRAM_API_KEY = os.getenv('TELEGRAM_BT_VangDo_bot_API')
@@ -74,16 +78,50 @@ class XAUUSDBacktester:
     
     def fetch_data(self) -> Optional[pd.DataFrame]:
         """
-        Fetch XAUUSD data với fallback chain:
-          1. XAUUSD=X  — spot gold, gần nhất với OANDA:XAUUSD trên TradingView
-          2. GC=F      — Gold Futures COMEX, fallback nếu spot không có dữ liệu
+        Fetch XAU/USD Spot từ Stooq (spot forex, giống nguồn broker forex).
+        Stooq XAUUSD = spot gold USD/oz — khớp với OANDA/FXCM trên TradingView.
+        Fallback: XAUUSD=X (Yahoo), rồi GC=F (futures).
         """
-        # Ticker ưu tiên: spot trước, futures sau
-        tickers = [('XAUUSD=X', 'Spot'), ('GC=F', 'Futures fallback')]
+        import pandas_datareader.data as web
 
+        # Map timeframe cho stooq (không hỗ trợ weekly/monthly trực tiếp → resample)
+        try:
+            print("Trying Stooq XAUUSD (spot forex)...")
+            df = web.DataReader(
+                'XAUUSD',
+                'stooq',
+                start=self.start_date,
+                end=self.end_date,
+            )
+            if df is not None and not df.empty:
+                df = df.sort_index()
+                # Stooq trả daily → resample nếu cần weekly/monthly
+                if self.timeframe == 'w':
+                    df = df.resample('W').agg({
+                        'Open': 'first', 'High': 'max',
+                        'Low': 'min',   'Close': 'last', 'Volume': 'sum'
+                    }).dropna(subset=['Close'])
+                elif self.timeframe == 'm':
+                    df = df.resample('ME').agg({
+                        'Open': 'first', 'High': 'max',
+                        'Low': 'min',   'Close': 'last', 'Volume': 'sum'
+                    }).dropna(subset=['Close'])
+
+                if 'Volume' not in df.columns:
+                    df['Volume'] = 0
+                df = df[['Close', 'High', 'Low', 'Volume']].copy()
+                df.index.name = 'Date'
+                print(f"  ✓ {len(df)} bars | Stooq XAUUSD (spot) {self.timeframe.upper()}")
+                print(f"  Range: {df.index[0].date()} → {df.index[-1].date()}")
+                return df
+        except Exception as e:
+            print(f"  → Stooq error: {e}")
+
+        # Fallback: yfinance
+        tickers = [('XAUUSD=X', 'Yahoo Spot'), ('GC=F', 'Yahoo Futures')]
         for ticker, label in tickers:
             try:
-                print(f"Trying {ticker} ({label})...")
+                print(f"Trying yfinance {ticker} ({label})...")
                 df = yf.download(
                     ticker,
                     start=self.start_date,
@@ -93,44 +131,26 @@ class XAUUSDBacktester:
                     auto_adjust=True,
                 )
                 if df is None or df.empty:
-                    print(f"  → Empty response for {ticker}")
                     continue
-
-                # Flatten MultiIndex columns (yfinance >= 0.2.38)
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.droplevel(1)
-
-                # Kiểm tra đủ cột cần thiết
                 missing = [c for c in ['Close', 'High', 'Low'] if c not in df.columns]
                 if missing:
-                    print(f"  → Missing columns {missing} for {ticker}")
                     continue
-
-                # Volume không bắt buộc với spot forex
                 if 'Volume' not in df.columns:
                     df['Volume'] = 0
-
                 df = df[['Close', 'High', 'Low', 'Volume']].copy()
                 for col in df.columns:
                     df[col] = df[col].squeeze()
-
-                df = df.dropna(subset=['Close'])
-                df = df.sort_index()
+                df = df.dropna(subset=['Close']).sort_index()
                 df.index.name = 'Date'
-
-                if df.empty:
-                    print(f"  → All NaN after dropna for {ticker}")
-                    continue
-
-                print(f"  ✓ Fetched {len(df)} bars | {ticker} ({label}) {self.timeframe.upper()}")
-                print(f"  Date range: {df.index[0].date()} → {df.index[-1].date()}")
+                print(f"  ✓ {len(df)} bars | {ticker} {self.timeframe.upper()}")
                 return df
-
             except Exception as e:
-                print(f"  → Error for {ticker}: {e}")
+                print(f"  → {ticker} error: {e}")
                 continue
 
-        print("fetch_data: all tickers failed")
+        print("fetch_data: all sources failed")
         return None
     
     def fetch_minute_data(self, date_str: str) -> Optional[pd.DataFrame]:
@@ -272,7 +292,19 @@ class XAUUSDBacktester:
             return None
     
     def run_backtest(self, df: pd.DataFrame) -> Tuple[Dict, List]:
-        """Run backtest with proper trailing stop logic"""
+        """
+        Run backtest.
+
+        Logic trailing stop đúng:
+        - Stop level tính từ HIGH CAO NHẤT kể từ ngày entry (trailing theo đỉnh)
+        - Stop = highest_high * (1 - stop_pct)
+        - Stop chỉ di chuyển LÊN, không xuống
+
+        Lý do 8 signals → 4 trades trước đây:
+        - Stop level tính từ current_price mỗi bar → stop nhảy loạn
+        - Trailing stop kích hoạt ngay bar entry → đóng trade tức thì
+        - Buy signal tiếp theo bị miss vì reset chậm
+        """
         results = {
             'total_trades': 0,
             'winning_trades': 0,
@@ -283,85 +315,90 @@ class XAUUSDBacktester:
             'blowup': False,
             'blowup_date': None
         }
-        
+
         max_balance = self.balance
-        
+        highest_high = None   # đỉnh cao nhất kể từ entry → trailing theo đây
+
         for i in range(len(df)):
             current_price = df['Close'].iloc[i]
-            current_date = df.index[i]
-            signal = df['Signal'].iloc[i]
-            avg_change = df['Avg_Price_Change'].iloc[i]
-            
-            # In position: check sell signal OR trailing stop
+            current_high  = df['High'].iloc[i]
+            current_low   = df['Low'].iloc[i]
+            current_date  = df.index[i]
+            signal        = df['Signal'].iloc[i]
+            avg_change    = df['Avg_Price_Change'].iloc[i]
+
             if self.position == 'long':
-                # Calculate current trailing stop level
-                # Trailing stop = current price - (avg_change + x%) * current_price
-                stop_distance_pct = (avg_change + self.trailing_stop_pct * 100) / 100
-                trailing_stop_level = current_price * (1 - stop_distance_pct)
-                
-                # Exit if:
-                # 1. Sell signal (RSI crosses below SMA)
-                # 2. Price hits trailing stop (Low touches or goes below stop)
-                
+                # Cập nhật đỉnh trailing
+                if not np.isnan(current_high):
+                    highest_high = max(highest_high, current_high)
+
+                # Stop level = đỉnh - (avg_volatility + x%) * đỉnh
+                stop_pct = (avg_change + self.trailing_stop_pct * 100) / 100                            if not np.isnan(avg_change) else self.trailing_stop_pct
+                trailing_stop_level = highest_high * (1 - stop_pct)
+
                 exit_price = None
-                exit_type = None
-                
-                # Check sell signal first
+                exit_type  = None
+                exit_date_str = str(current_date.date())
+
                 if signal == -1:
+                    # Sell signal: thoát tại close
                     exit_price = current_price
-                    exit_type = 'sell_signal'
-                
-                # Check trailing stop
-                elif df['Low'].iloc[i] <= trailing_stop_level:
-                    # Try to get minute-level exit price
-                    exit_date_str = str(current_date.date())
-                    minute_exit = self.get_exact_exit_price(self.entry_date, exit_date_str, trailing_stop_level)
-                    exit_price = minute_exit if minute_exit else df['Low'].iloc[i]
-                    exit_type = 'trailing_stop'
-                
-                # Execute exit if triggered
+                    exit_type  = 'sell_signal'
+
+                elif current_low <= trailing_stop_level:
+                    # Trailing stop chạm: tìm exit chính xác ở minute-level
+                    minute_exit = self.get_exact_exit_price(
+                        self.entry_date, exit_date_str, trailing_stop_level)
+                    exit_price = minute_exit if minute_exit else trailing_stop_level
+                    exit_type  = 'trailing_stop'
+
                 if exit_price is not None:
                     pnl = (exit_price - self.entry_price) / self.entry_price
                     self.balance += self.initial_capital * pnl
-                    
+
                     self.closed_trades.append({
-                        'entry_date': str(self.entry_date.date()),
+                        'entry_date':  str(self.entry_date.date()),
                         'entry_price': round(self.entry_price, 2),
-                        'exit_date': exit_date_str if exit_type == 'trailing_stop' else str(current_date.date()),
-                        'exit_price': round(exit_price, 2),
-                        'pnl_pct': round(pnl * 100, 2),
-                        'type': exit_type
+                        'exit_date':   exit_date_str,
+                        'exit_price':  round(exit_price, 2),
+                        'pnl_pct':     round(pnl * 100, 2),
+                        'type':        exit_type,
+                        'stop_level':  round(trailing_stop_level, 2),
                     })
-                    
-                    self.position = None
+
+                    self.position  = None
+                    highest_high   = None
                     results['total_trades'] += 1
                     if pnl > 0:
                         results['winning_trades'] += 1
                     else:
                         results['losing_trades'] += 1
-            
-            # Entry signal (only if not already in position)
+
+            # Entry: chỉ vào lệnh khi không có position
             elif signal == 1 and self.position is None:
-                self.position = 'long'
+                self.position    = 'long'
                 self.entry_price = current_price
-                self.entry_date = current_date
-            
-            # Check blowup
+                self.entry_date  = current_date
+                highest_high     = current_high   # bắt đầu trailing từ bar entry
+
+            # Blowup check
             if self.balance <= 0:
-                self.blowup_date = str(current_date.date())
-                results['blowup'] = True
-                results['blowup_date'] = self.blowup_date
-                results['final_balance'] = self.balance
+                results.update({
+                    'blowup': True,
+                    'blowup_date': str(current_date.date()),
+                    'final_balance': self.balance,
+                })
                 return results, self.closed_trades
-            
-            # Track drawdown
+
+            # Max drawdown
             max_balance = max(max_balance, self.balance)
-            drawdown = (max_balance - self.balance) / max_balance * 100 if max_balance > 0 else 0
-            results['max_drawdown'] = max(results['max_drawdown'], drawdown)
-        
-        results['total_return_pct'] = (self.balance - self.initial_capital) / self.initial_capital * 100
+            if max_balance > 0:
+                drawdown = (max_balance - self.balance) / max_balance * 100
+                results['max_drawdown'] = max(results['max_drawdown'], drawdown)
+
+        results['total_return_pct'] = (
+            (self.balance - self.initial_capital) / self.initial_capital * 100)
         results['final_balance'] = self.balance
-        
         return results, self.closed_trades
 
 
