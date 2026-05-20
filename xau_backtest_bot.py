@@ -141,12 +141,59 @@ class XAUUSDBacktester:
             # Return empty Series on error
             return pd.Series(np.nan, index=prices.index)
     
+    def smma(self, series: pd.Series, period: int) -> pd.Series:
+        """Smoothed Moving Average (same as weeklyscan.py)"""
+        values = series.values.astype(float)
+        result = np.full(len(values), np.nan)
+        count, start = 0, -1
+        
+        # Find first non-NaN value
+        for i, v in enumerate(values):
+            if not np.isnan(v):
+                count += 1
+                if count == period:
+                    start = i
+                    break
+            else:
+                count = 0
+        
+        if start == -1:
+            return pd.Series(result, index=series.index)
+        
+        # Initialize with simple average
+        result[start] = np.mean(values[start - period + 1: start + 1])
+        
+        # Apply SMMA smoothing
+        for i in range(start + 1, len(values)):
+            if not np.isnan(values[i]):
+                result[i] = (result[i-1] * (period - 1) + values[i]) / period
+            else:
+                result[i] = result[i-1]
+        
+        return pd.Series(result, index=series.index)
+    
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate indicators"""
-        df['RSI'] = self.calculate_rsi_wilder(df['Close'], period=14)
-        df['SMA_RSI'] = df['RSI'].rolling(window=14).mean()
+        """Calculate indicators - same as weeklyscan.py"""
+        df = df.copy()
+        
+        # RSI using SMMA
+        delta = df['Close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+        
+        avg_gain = self.smma(gain, 14)
+        avg_loss = self.smma(loss, 14)
+        
+        rs = avg_gain / avg_loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # SMA of RSI
+        df['SMA_RSI'] = df['RSI'].rolling(14).mean()
+        
+        # Avg price change for trailing stop
         df['Price_Change_Pct'] = df['Close'].pct_change().abs() * 100
         df['Avg_Price_Change'] = df['Price_Change_Pct'].rolling(window=self.n_periods).mean()
+        
         return df
     
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
