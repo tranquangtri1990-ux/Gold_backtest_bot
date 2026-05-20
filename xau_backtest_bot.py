@@ -63,24 +63,35 @@ class XAUUSDBacktester:
         
     @staticmethod
     def _parse_date(date_str: str) -> str:
-        """Parse dd/mm/yy to yyyy-mm-dd"""
-        try:
-            date_obj = datetime.strptime(date_str, '%d/%m/%y')
-            return date_obj.strftime('%Y-%m-%d')
-        except:
-            return None
+        """Parse dd/mm/yyyy to yyyy-mm-dd"""
+        for fmt in ('%d/%m/%Y', '%d/%m/%y'):
+            try:
+                date_obj = datetime.strptime(date_str, fmt)
+                return date_obj.strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+        return None
     
     def fetch_data(self) -> Optional[pd.DataFrame]:
         """Fetch XAU/USD data"""
         try:
             df = yf.download('GC=F', start=self.start_date, end=self.end_date,
-                           interval=self.interval, progress=False)
+                           interval=self.interval, progress=False, auto_adjust=True)
             if df.empty:
                 return None
+            # Fix: newer yfinance returns MultiIndex columns like ('Close', 'GC=F')
+            # Flatten to single-level ('Close', 'High', ...) before further use
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
             df = df[['Close', 'High', 'Low', 'Volume']].copy()
+            # Ensure all columns are 1D Series (not nested DataFrames)
+            for col in df.columns:
+                if hasattr(df[col], 'squeeze'):
+                    df[col] = df[col].squeeze()
             df.index.name = 'Date'
             return df
-        except:
+        except Exception as e:
+            print(f"fetch_data error: {e}")
             return None
     
     def fetch_minute_data(self, date_str: str) -> Optional[pd.DataFrame]:
@@ -96,9 +107,9 @@ class XAUUSDBacktester:
             if df.empty:
                 return None
             
-            # Ensure columns are clean
+            # Fix: droplevel(1) drops ticker 'GC=F', keeping field names ('Close', 'Low', ...)
             if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(0)
+                df.columns = df.columns.droplevel(1)
             
             # Select only needed columns
             if 'Close' in df.columns and 'Low' in df.columns:
@@ -510,7 +521,17 @@ def set_start_date(message):
             return
         
         date_str = args[1]
-        datetime.strptime(date_str, '%d/%m/%y')  # Validate
+        # Accept both dd/mm/yyyy and dd/mm/yy
+        parsed = None
+        for fmt in ('%d/%m/%Y', '%d/%m/%y'):
+            try:
+                parsed = datetime.strptime(date_str, fmt)
+                break
+            except ValueError:
+                continue
+        if not parsed:
+            bot.send_message(message.chat.id, "❌ Invalid date format (use dd/mm/yyyy, e.g. 01/01/2023)")
+            return
         USER_PARAMS['start_date'] = date_str
         bot.send_message(message.chat.id, f"✅ Start date set to <code>{date_str}</code>", parse_mode='HTML')
     except:
@@ -526,7 +547,17 @@ def set_end_date(message):
             return
         
         date_str = args[1]
-        datetime.strptime(date_str, '%d/%m/%y')  # Validate
+        # Accept both dd/mm/yyyy and dd/mm/yy
+        parsed = None
+        for fmt in ('%d/%m/%Y', '%d/%m/%y'):
+            try:
+                parsed = datetime.strptime(date_str, fmt)
+                break
+            except ValueError:
+                continue
+        if not parsed:
+            bot.send_message(message.chat.id, "❌ Invalid date format (use dd/mm/yyyy, e.g. 10/05/2026)")
+            return
         USER_PARAMS['end_date'] = date_str
         bot.send_message(message.chat.id, f"✅ End date set to <code>{date_str}</code>", parse_mode='HTML')
     except:
