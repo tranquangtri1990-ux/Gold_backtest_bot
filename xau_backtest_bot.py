@@ -185,22 +185,24 @@ def run_backtest(df: pd.DataFrame, start_date: str,
         high    = float(df['High'].iloc[i])
         low     = float(df['Low'].iloc[i])
         signal  = int(df['Signal'].iloc[i])
-        avg_mv  = df['Avg_Move'].iloc[i]
         date_s  = str(bar.date())
-        stop_pct = ((avg_mv if not np.isnan(avg_mv) else 0) + trailing_pct) / 100
+        # Chỉ dùng trailing_pct thuần — KHÔNG cộng avg_mv
+        # avg_mv làm stop quá rộng → trailing stop không bao giờ trigger
+        stop_pct = trailing_pct / 100.0
 
         # Update + check exit for each open trade
         still_open = []
         for t in open_trades:
             t['peak'] = max(t['peak'], high)
-            stop_lvl  = t['peak'] * (1 - stop_pct)
+            stop_lvl  = t['peak'] * (1 - stop_pct) if stop_pct > 0 else 0
             ep = None; etype = None
 
-            if signal == -1:
-                ep, etype = price, 'signal'
-            elif low <= stop_lvl:
+            # Trailing stop TRƯỚC signal: stop là giá intrabar đã bị chạm
+            if stop_pct > 0 and low <= stop_lvl:
                 ep = fetch_minute(date_s, stop_lvl) or stop_lvl
                 etype = 'stop'
+            elif signal == -1:
+                ep, etype = price, 'signal'
 
             if ep is not None:
                 pnl = (ep - t['entry']) * lot * LOT_SIZE_OZ
