@@ -1,760 +1,387 @@
 #!/usr/bin/env python3
-"""
-XAU/USD Backtest Bot - Telegram integrated
-Stores params via /phiên, /vốn, /timeframe, /time_start, /time_end, /x%
-Backtests on higher timeframe, validates exit at minute level
-"""
+"""XAU/USD Backtest Bot — RSI(14) crossover SMA(RSI,14), lot-based PnL"""
 
-import pandas as pd
+import os, io, threading
 import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
-import telebot
-import os
-import json
-import threading
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
-import yfinance as yf
 import requests
-import io
+import yfinance as yf
+import telebot
 
-# Initialize Telegram bot
-TELEGRAM_API_KEY = os.getenv('TELEGRAM_BT_VangDo_bot_API')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# ── Config ────────────────────────────────────────────────────────────────────
+API_KEY  = os.getenv('TELEGRAM_BT_VangDo_bot_API')
+CHAT_ID  = os.getenv('TELEGRAM_CHAT_ID')
+if not API_KEY or not CHAT_ID:
+    print("Missing TELEGRAM_BT_VangDo_bot_API or TELEGRAM_CHAT_ID"); exit(1)
 
-if not TELEGRAM_API_KEY or not TELEGRAM_CHAT_ID:
-    print("Error: Missing TELEGRAM_BT_VangDo_bot_API or TELEGRAM_CHAT_ID")
-    exit(1)
+bot = telebot.TeleBot(API_KEY)
 
-bot = telebot.TeleBot(TELEGRAM_API_KEY)
+# XAU/USD forex: 1 lot = 100 oz. PnL = Δprice × lot × 100
+LOT_SIZE_OZ = 100
 
-# Global user parameters (stored in memory, can add JSON persistence)
-USER_PARAMS = {
-    'n_periods': 20,
-    'initial_capital': 500.0,
-    'timeframe': None,
-    'start_date': '01/01/2023',
-    'end_date': None,
-    'trailing_stop_pct': 0.0
+P = {   # user params
+    'timeframe':    None,
+    'start_date':   '01/01/2023',
+    'end_date':     None,
+    'lot':          0.01,
+    'trailing_pct': 0.0,
+    'n_periods':    20,
 }
 
 
-class XAUUSDBacktester:
-    def __init__(self, timeframe: str, n_periods: int = 20, trailing_stop_pct: float = 0.0,
-                 initial_capital: float = 500.0, start_date: str = None, end_date: str = None):
-        """Initialize backtest parameters"""
-        self.timeframe = timeframe.lower()
-        self.n_periods = n_periods
-        self.trailing_stop_pct = trailing_stop_pct / 100
-        self.initial_capital = initial_capital
-        
-        # Parse dates
-        self.start_date = self._parse_date(start_date) if start_date else '2023-01-01'
-        self.end_date = self._parse_date(end_date) if end_date else datetime.now().strftime('%Y-%m-%d')
-        
-        # Map timeframe
-        self.interval_map = {'d': '1d', 'w': '1wk', 'm': '1mo'}
-        self.interval = self.interval_map.get(self.timeframe, '1d')
-        
-        # Trading state
-        self.position = None
-        self.entry_price = None
-        self.entry_date = None
-        self.balance = initial_capital
-        self.closed_trades = []
-        self.blowup_date = None
-        
-    @staticmethod
-    def _parse_date(date_str: str) -> str:
-        """Parse dd/mm/yyyy hoặc dd/mm/yy → yyyy-mm-dd"""
-        for fmt in ('%d/%m/%Y', '%d/%m/%y'):
-            try:
-                return datetime.strptime(date_str, fmt).strftime('%Y-%m-%d')
-            except ValueError:
-                continue
-        return None
-    
-    def _stooq_fetch_daily(self, start: str, end: str) -> Optional[pd.DataFrame]:
-        """Fetch daily XAUUSD từ Stooq qua CSV API (không cần thư viện thêm)"""
-        try:
-            d1 = start.replace('-', '')
-            d2 = end.replace('-', '')
-            url = f"https://stooq.com/q/d/l/?s=xauusd&d1={d1}&d2={d2}&i=d"
-            resp = requests.get(url, timeout=15,
-                                headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200 or len(resp.text) < 50:
-                return None
-            df = pd.read_csv(io.StringIO(resp.text))
-            # Stooq trả: Date,Open,High,Low,Close,Volume
-            df.columns = [c.strip().capitalize() for c in df.columns]
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df.set_index('Date').sort_index()
-            if 'Volume' not in df.columns:
-                df['Volume'] = 0
-            return df[['Close', 'High', 'Low', 'Volume']].dropna(subset=['Close'])
-        except Exception as e:
-            print(f"  → Stooq HTTP error: {e}")
-            return None
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def parse_date(s: str) -> Optional[str]:
+    for fmt in ('%d/%m/%Y', '%d/%m/%y'):
+        try: return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+        except ValueError: pass
+    return None
 
-    def fetch_data(self) -> Optional[pd.DataFrame]:
-        """
-        Fetch XAU/USD Spot với WARMUP PERIOD để RSI khớp TradingView.
 
-        Vấn đề RSI sai: TradingView tính RMA từ hàng nghìn bar lịch sử →
-        RMA đã converge hoàn toàn. Nếu ta chỉ seed từ bar thứ 14 của
-        start_date → RMA chưa ổn định → RSI lệch.
+# ── Data fetching ─────────────────────────────────────────────────────────────
+def _stooq(start: str, end: str) -> Optional[pd.DataFrame]:
+    try:
+        url = f"https://stooq.com/q/d/l/?s=xauusd&d1={start.replace('-','')}&d2={end.replace('-','')}&i=d"
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or len(r.text) < 50: return None
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [c.strip().capitalize() for c in df.columns]
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.set_index('Date').sort_index()
+        if 'Volume' not in df.columns: df['Volume'] = 0
+        return df[['Close','High','Low','Volume']].dropna(subset=['Close'])
+    except: return None
 
-        Fix: lấy thêm 300 bar TRƯỚC start_date để warm up RMA,
-        sau đó backtest chỉ dùng data từ start_date trở đi.
-        """
-        end = self.end_date or datetime.now().strftime('%Y-%m-%d')
 
-        # Tính warmup_start = start_date - 2 năm (đủ để RSI converge)
-        start_dt = datetime.strptime(self.start_date, '%Y-%m-%d')
-        warmup_start = (start_dt - timedelta(days=730)).strftime('%Y-%m-%d')
+def _yf(ticker: str, start: str, end: str, interval: str) -> Optional[pd.DataFrame]:
+    try:
+        df = yf.download(ticker, start=start, end=end, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df is None or df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
+        df.columns = [c.capitalize() for c in df.columns]
+        if 'Volume' not in df.columns: df['Volume'] = 0
+        if any(c not in df.columns for c in ['Close','High','Low']): return None
+        df = df[['Close','High','Low','Volume']].copy()
+        for col in df.columns: df[col] = df[col].squeeze()
+        return df.dropna(subset=['Close']).sort_index()
+    except: return None
 
-        def _clean(df):
-            """Normalize dataframe từ bất kỳ nguồn nào"""
-            if df is None or df.empty:
-                return None
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            df.columns = [c.strip().capitalize() for c in df.columns]
-            if 'Volume' not in df.columns:
-                df['Volume'] = 0
-            if any(c not in df.columns for c in ['Close', 'High', 'Low']):
-                return None
-            df = df[['Close', 'High', 'Low', 'Volume']].copy()
-            for col in df.columns:
-                if hasattr(df[col], 'squeeze'):
-                    df[col] = df[col].squeeze()
-            df = df.dropna(subset=['Close']).sort_index()
-            df.index.name = 'Date'
-            return df if not df.empty else None
 
-        # ── Source 1: Stooq (daily raw, resample sau) ────────────────────────
-        print(f"Trying Stooq XAUUSD (warmup từ {warmup_start})...")
-        df_raw = self._stooq_fetch_daily(warmup_start, end)
-        if df_raw is not None and not df_raw.empty:
-            if self.timeframe == 'w':
-                df_raw = df_raw.resample('W').agg(
-                    {'Close': 'last', 'High': 'max', 'Low': 'min', 'Volume': 'sum'}
-                ).dropna(subset=['Close'])
-            elif self.timeframe == 'm':
-                df_raw = df_raw.resample('ME').agg(
-                    {'Close': 'last', 'High': 'max', 'Low': 'min', 'Volume': 'sum'}
-                ).dropna(subset=['Close'])
-            df_raw.index.name = 'Date'
-            print(f"  ✓ {len(df_raw)} bars total (incl. warmup) | Stooq XAUUSD")
-            return df_raw
+def fetch_data(timeframe: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch XAUUSD Spot với 2 năm warmup để RSI converge giống TradingView.
+    Nguồn: Stooq (spot forex) → XAUUSD=X → GC=F
+    """
+    end = end_date or datetime.now().strftime('%Y-%m-%d')
+    warmup = (datetime.strptime(start_date,'%Y-%m-%d') - timedelta(days=730)).strftime('%Y-%m-%d')
+    iv_map = {'d':'1d','w':'1wk','m':'1mo'}
+    interval = iv_map.get(timeframe,'1d')
 
-        print("  → Stooq failed, trying yfinance...")
-
-        # ── Source 2 & 3: yfinance fallback ──────────────────────────────────
-        for ticker, label in [('XAUUSD=X', 'Yahoo Spot'), ('GC=F', 'Yahoo Futures')]:
-            try:
-                print(f"Trying yfinance {ticker} ({label})...")
-                df = yf.download(
-                    ticker,
-                    start=warmup_start,
-                    end=end,
-                    interval=self.interval,
-                    progress=False,
-                    auto_adjust=True,
-                )
-                df = _clean(df)
-                if df is not None:
-                    print(f"  ✓ {len(df)} bars total (incl. warmup) | {ticker}")
-                    return df
-                print(f"  → Empty or unusable")
-            except Exception as e:
-                print(f"  → {ticker} error: {e}")
-
-        print("fetch_data: all sources failed")
-        return None
-    
-    def fetch_minute_data(self, date_str: str) -> Optional[pd.DataFrame]:
-        """Fetch 1-minute XAUUSD=X để tìm giá exit chính xác trong ngày"""
-        try:
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-            start = date_obj.strftime('%Y-%m-%d')
-            end   = (date_obj + timedelta(days=1)).strftime('%Y-%m-%d')
-
-            df = yf.download(
-                'XAUUSD=X',
-                start=start, end=end,
-                interval='1m',
-                progress=False,
-                auto_adjust=True,
-            )
-            if df.empty:
-                return None
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-
-            if 'Close' in df.columns and 'Low' in df.columns:
-                return df[['Close', 'Low']]
-            return None
-        except Exception as e:
-            print(f"fetch_minute_data error: {e}")
-            return None
-    
-    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Tính RSI(14) Wilder + SMA(RSI,14) — khớp chính xác TradingView.
-
-        TradingView Pine Script tương đương:
-            rsi    = ta.rsi(close, 14)        // dùng RMA (Wilder smoothing)
-            signal = ta.sma(rsi, 14)
-
-        Công thức RMA (Wilder):
-            seed  = mean(gain[1..14])          // bar 1-14, bỏ bar 0 (NaN diff)
-            rma_i = (rma_{i-1} * 13 + gain_i) / 14
-        """
-        df = df.copy()
-        period = 14
-
-        # --- Bước 1: tính gain/loss ---
-        # .diff() → bar 0 = NaN, bar 1 trở đi có giá trị
-        # KHÔNG dùng np.where hay .where() vì cả hai biến NaN thành 0 khi NaN>0=False
-        # Dùng clip() để NaN được giữ nguyên, chỉ flip dấu âm về 0
-        close = df['Close'].squeeze()   # đảm bảo 1-D Series
-        delta = close.diff()
-        gain  = delta.clip(lower=0)     # âm → 0, NaN → NaN
-        loss  = (-delta).clip(lower=0)  # dương → 0, NaN → NaN
-
-        # Convert sang numpy để loop nhanh
-        g = gain.values.astype(float)   # g[0] = NaN (từ diff)
-        l = loss.values.astype(float)
-        n = len(g)
-
-        avg_g = np.full(n, np.nan)
-        avg_l = np.full(n, np.nan)
-
-        # --- Bước 2: seed tại bar 14 (index 14) ---
-        # TradingView seed = SMA của 14 giá trị đầu tiên CÓ dữ liệu
-        # Vì g[0]=NaN, 14 giá trị đầu tiên hợp lệ là g[1]..g[14]
-        if n > period:
-            avg_g[period] = np.nanmean(g[1 : period + 1])
-            avg_l[period] = np.nanmean(l[1 : period + 1])
-
-            # --- Bước 3: Wilder smoothing từ bar 15 trở đi ---
-            for i in range(period + 1, n):
-                avg_g[i] = (avg_g[i-1] * (period - 1) + g[i]) / period
-                avg_l[i] = (avg_l[i-1] * (period - 1) + l[i]) / period
-
-        # --- Bước 4: RSI ---
-        with np.errstate(divide='ignore', invalid='ignore'):
-            rs = np.where(avg_l == 0, np.inf, avg_g / avg_l)
-        rsi_vals = np.where(avg_l == 0, 100.0, 100.0 - 100.0 / (1.0 + rs))
-        # Bar 0..13 vẫn là NaN (chưa đủ data để seed)
-        rsi_vals[:period] = np.nan
-
-        df['RSI'] = pd.Series(rsi_vals, index=df.index)
-
-        # --- Bước 5: SMA(RSI, 14) — ta.sma trong TradingView ---
-        df['SMA_RSI'] = df['RSI'].rolling(window=period, min_periods=period).mean()
-
-        # Avg price change cho trailing stop
-        df['Price_Change_Pct'] = close.pct_change().abs() * 100
-        df['Avg_Price_Change']  = df['Price_Change_Pct'].rolling(
-            window=self.n_periods, min_periods=1).mean()
-
+    # 1. Stooq daily → resample nếu cần
+    df = _stooq(warmup, end)
+    if df is not None and not df.empty:
+        if timeframe == 'w':
+            df = df.resample('W').agg({'Close':'last','High':'max','Low':'min','Volume':'sum'}).dropna(subset=['Close'])
+        elif timeframe == 'm':
+            df = df.resample('ME').agg({'Close':'last','High':'max','Low':'min','Volume':'sum'}).dropna(subset=['Close'])
+        df.index.name = 'Date'
+        print(f"Stooq OK: {len(df)} bars")
         return df
-    
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Generate crossover signals - RSI crossing SMA(RSI)"""
-        df['Signal'] = 0
-        
-        for i in range(1, len(df)):
-            # Get values safely
-            rsi_prev = df['RSI'].iloc[i-1]
-            sma_prev = df['SMA_RSI'].iloc[i-1]
-            rsi_curr = df['RSI'].iloc[i]
-            sma_curr = df['SMA_RSI'].iloc[i]
-            
-            # Skip if any NaN
-            try:
-                if np.isnan(rsi_prev) or np.isnan(sma_prev) or np.isnan(rsi_curr) or np.isnan(sma_curr):
-                    continue
-            except:
-                continue
-            
-            # Buy: RSI crosses ABOVE SMA(RSI)
-            if rsi_prev <= sma_prev and rsi_curr > sma_curr:
-                df.loc[df.index[i], 'Signal'] = 1
-            
-            # Sell: RSI crosses BELOW SMA(RSI)
-            elif rsi_prev >= sma_prev and rsi_curr < sma_curr:
-                df.loc[df.index[i], 'Signal'] = -1
-        
-        return df
-    
-    def get_exact_exit_price(self, entry_date, exit_date_str, trailing_stop_level):
-        """
-        Get exact exit price at minute level when stop loss is hit.
-        Returns the close price of the minute when price first touched stop level.
-        """
-        try:
-            minute_df = self.fetch_minute_data(exit_date_str)
-            if minute_df is None or minute_df.empty:
-                # Fallback to daily close
-                return None
-            
-            # Find first minute where Low <= stop_level
-            for idx, row in minute_df.iterrows():
-                if row['Low'] <= trailing_stop_level:
-                    return row['Close']
-            
-            return None
-        except:
-            return None
-    
-    def run_backtest(self, df: pd.DataFrame) -> Tuple[Dict, List]:
-        """
-        Run backtest — multiple positions đồng thời.
 
-        Mỗi buy signal mở 1 lệnh mới, bất kể đang có lệnh khác.
-        Mỗi lệnh được track riêng với entry_price, highest_high, stop riêng.
-        Sell signal đóng TẤT CẢ lệnh đang mở.
+    # 2-3. yfinance fallback
+    for ticker in ('XAUUSD=X','GC=F'):
+        df = _yf(ticker, warmup, end, interval)
+        if df is not None:
+            print(f"yfinance {ticker} OK: {len(df)} bars")
+            return df
 
-        Chỉ backtest từ self.start_date (data trước đó chỉ dùng để warm up RSI).
-        """
-        results = {
-            'total_trades': 0,
-            'winning_trades': 0,
-            'losing_trades': 0,
-            'total_return_pct': 0,
-            'final_balance': self.balance,
-            'max_drawdown': 0,
-            'blowup': False,
-            'blowup_date': None
-        }
+    return None
 
-        max_balance = self.balance
-        # Danh sách lệnh đang mở: mỗi lệnh là dict {entry_price, entry_date, highest_high}
-        open_trades = []
 
-        # Chỉ bắt đầu backtest từ start_date (sau warmup)
-        start_ts = pd.Timestamp(self.start_date)
+def fetch_minute(date_str: str, stop_level: float) -> Optional[float]:
+    """Tìm giá exit chính xác tại minute khi trailing stop chạm"""
+    try:
+        d = datetime.strptime(date_str,'%Y-%m-%d')
+        df = _yf('XAUUSD=X', d.strftime('%Y-%m-%d'),
+                 (d+timedelta(days=1)).strftime('%Y-%m-%d'), '1m')
+        if df is None: return None
+        for _, row in df.iterrows():
+            if row['Low'] <= stop_level: return float(row['Close'])
+    except: pass
+    return None
 
-        for i in range(len(df)):
-            current_date  = df.index[i]
 
-            # Skip warmup period — chỉ theo dõi indicator, không trade
-            if current_date < start_ts:
-                continue
+# ── Indicators ────────────────────────────────────────────────────────────────
+def calc_rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
+    """RSI Wilder (RMA) — khớp TradingView ta.rsi()"""
+    g = close.diff().clip(lower=0).values.astype(float)
+    l = (-close.diff()).clip(lower=0).values.astype(float)
+    n = len(g)
+    ag = np.full(n, np.nan); al = np.full(n, np.nan)
+    if n > period:
+        ag[period] = np.nanmean(g[1:period+1])
+        al[period] = np.nanmean(l[1:period+1])
+        for i in range(period+1, n):
+            ag[i] = (ag[i-1]*(period-1) + g[i]) / period
+            al[i] = (al[i-1]*(period-1) + l[i]) / period
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rs = np.where(al==0, np.inf, ag/al)
+    rsi = np.where(al==0, 100.0, 100.0 - 100.0/(1.0+rs))
+    rsi[:period] = np.nan
+    return pd.Series(rsi, index=close.index)
 
-            current_price = df['Close'].iloc[i]
-            current_high  = df['High'].iloc[i]
-            current_low   = df['Low'].iloc[i]
-            signal        = df['Signal'].iloc[i]
-            avg_change    = df['Avg_Price_Change'].iloc[i]
-            exit_date_str = str(current_date.date())
 
-            stop_pct = (avg_change + self.trailing_stop_pct * 100) / 100                        if not np.isnan(avg_change) else self.trailing_stop_pct
+def add_indicators(df: pd.DataFrame, n_periods: int) -> pd.DataFrame:
+    df = df.copy()
+    close = df['Close'].squeeze()
+    df['RSI']     = calc_rsi_wilder(close)
+    df['SMA_RSI'] = df['RSI'].rolling(14, min_periods=14).mean()
+    df['Avg_Move'] = close.pct_change().abs().rolling(n_periods, min_periods=1).mean() * 100
+    return df
 
-            # ── Cập nhật trailing stop cho từng lệnh đang mở ──────────────
-            still_open = []
-            for trade in open_trades:
-                if not np.isnan(current_high):
-                    trade['highest_high'] = max(trade['highest_high'], current_high)
 
-                stop_level = trade['highest_high'] * (1 - stop_pct)
-                exit_price = None
-                exit_type  = None
+def add_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df['Signal'] = 0
+    rsi = df['RSI'].values; sma = df['SMA_RSI'].values
+    for i in range(1, len(df)):
+        if any(np.isnan(x) for x in [rsi[i-1],sma[i-1],rsi[i],sma[i]]): continue
+        if rsi[i-1] <= sma[i-1] and rsi[i] > sma[i]:  df['Signal'].iloc[i] =  1
+        elif rsi[i-1] >= sma[i-1] and rsi[i] < sma[i]: df['Signal'].iloc[i] = -1
+    return df
 
-                if signal == -1:
-                    exit_price = current_price
-                    exit_type  = 'sell_signal'
-                elif current_low <= stop_level:
-                    minute_exit = self.get_exact_exit_price(
-                        trade['entry_date'], exit_date_str, stop_level)
-                    exit_price = minute_exit if minute_exit else stop_level
-                    exit_type  = 'trailing_stop'
 
-                if exit_price is not None:
-                    pnl = (exit_price - trade['entry_price']) / trade['entry_price']
-                    self.balance += self.initial_capital * pnl
-                    self.closed_trades.append({
-                        'entry_date':  str(trade['entry_date'].date()),
-                        'entry_price': round(trade['entry_price'], 2),
-                        'exit_date':   exit_date_str,
-                        'exit_price':  round(exit_price, 2),
-                        'pnl_pct':     round(pnl * 100, 2),
-                        'type':        exit_type,
-                        'stop_level':  round(stop_level, 2),
-                    })
-                    results['total_trades'] += 1
-                    if pnl > 0:
-                        results['winning_trades'] += 1
-                    else:
-                        results['losing_trades'] += 1
-                else:
-                    still_open.append(trade)
+# ── Backtest ──────────────────────────────────────────────────────────────────
+def run_backtest(df: pd.DataFrame, start_date: str,
+                 lot: float, trailing_pct: float) -> Tuple[Dict, List]:
+    """
+    PnL tuyệt đối theo lot forex:
+        pnl_usd = (exit - entry) × lot × LOT_SIZE_OZ
 
-            open_trades = still_open
+    Nhiều lệnh đồng thời: mỗi buy signal mở 1 lệnh mới độc lập.
+    Sell signal đóng tất cả lệnh đang mở.
+    Trailing stop = highest_high × (1 - stop_pct), chỉ đi lên.
+    """
+    start_ts   = pd.Timestamp(start_date)
+    open_trades: List[Dict] = []
+    closed:      List[Dict] = []
+    total_pnl   = 0.0
+    peak_pnl    = 0.0
+    max_dd      = 0.0
 
-            # ── Mở lệnh mới khi có buy signal (không giới hạn số lệnh) ────
-            if signal == 1:
-                open_trades.append({
-                    'entry_price':  current_price,
-                    'entry_date':   current_date,
-                    'highest_high': current_high,
+    for i in range(len(df)):
+        bar = df.index[i]
+        if bar < start_ts: continue
+
+        price   = float(df['Close'].iloc[i])
+        high    = float(df['High'].iloc[i])
+        low     = float(df['Low'].iloc[i])
+        signal  = int(df['Signal'].iloc[i])
+        avg_mv  = df['Avg_Move'].iloc[i]
+        date_s  = str(bar.date())
+        stop_pct = ((avg_mv if not np.isnan(avg_mv) else 0) + trailing_pct) / 100
+
+        # Update + check exit for each open trade
+        still_open = []
+        for t in open_trades:
+            t['peak'] = max(t['peak'], high)
+            stop_lvl  = t['peak'] * (1 - stop_pct)
+            ep = None; etype = None
+
+            if signal == -1:
+                ep, etype = price, 'signal'
+            elif low <= stop_lvl:
+                ep = fetch_minute(date_s, stop_lvl) or stop_lvl
+                etype = 'stop'
+
+            if ep is not None:
+                pnl = (ep - t['entry']) * lot * LOT_SIZE_OZ
+                total_pnl += pnl
+                closed.append({
+                    'entry_date':  t['date'],
+                    'entry_price': round(t['entry'], 2),
+                    'exit_date':   date_s,
+                    'exit_price':  round(ep, 2),
+                    'pnl_usd':     round(pnl, 2),
+                    'type':        etype,
+                    'stop_lvl':    round(stop_lvl, 2),
                 })
+            else:
+                still_open.append(t)
 
-            # Blowup check
-            if self.balance <= 0:
-                results.update({
-                    'blowup': True,
-                    'blowup_date': exit_date_str,
-                    'final_balance': self.balance,
-                })
-                return results, self.closed_trades
+        open_trades = still_open
 
-            max_balance = max(max_balance, self.balance)
-            if max_balance > 0:
-                drawdown = (max_balance - self.balance) / max_balance * 100
-                results['max_drawdown'] = max(results['max_drawdown'], drawdown)
+        # New entry on buy signal
+        if signal == 1:
+            open_trades.append({'entry': price, 'date': date_s, 'peak': high})
 
-        results['total_return_pct'] = (
-            (self.balance - self.initial_capital) / self.initial_capital * 100)
-        results['final_balance'] = self.balance
-        return results, self.closed_trades
+        # Track max drawdown
+        peak_pnl = max(peak_pnl, total_pnl)
+        dd = peak_pnl - total_pnl
+        max_dd = max(max_dd, dd)
+
+    wins   = sum(1 for t in closed if t['pnl_usd'] > 0)
+    losses = len(closed) - wins
+    return {
+        'total_trades': len(closed),
+        'wins':         wins,
+        'losses':       losses,
+        'total_pnl':    round(total_pnl, 2),
+        'max_dd':       round(max_dd, 2),
+        'open_count':   len(open_trades),
+    }, closed
 
 
-def format_results(results: Dict, trades: List) -> str:
-    """Format backtest results for Telegram"""
-    msg = f"<b>📊 XAU/USD Backtest Results</b>\n"
-    msg += f"{'─' * 40}\n\n"
-    
-    msg += f"<b>📌 Parameters:</b>\n"
-    msg += f"Timeframe: <code>{USER_PARAMS['timeframe'].upper()}</code>\n"
-    msg += f"Period: <code>{USER_PARAMS['start_date']}</code> → <code>{USER_PARAMS['end_date'] or 'today'}</code>\n"
-    msg += f"Capital: <code>${USER_PARAMS['initial_capital']:.2f}</code>\n"
-    msg += f"N Periods: <code>{USER_PARAMS['n_periods']}</code>\n"
-    msg += f"Trailing Stop: <code>Avg Change + {USER_PARAMS['trailing_stop_pct']:.1f}%</code>\n\n"
-    
-    msg += f"<b>📈 Results:</b>\n"
-    msg += f"Total Trades: <code>{results['total_trades']}</code>\n"
-    
-    if results['total_trades'] > 0:
-        win_rate = (results['winning_trades'] / results['total_trades']) * 100
-        msg += f"Win/Loss: <code>{results['winning_trades']}/{results['losing_trades']}</code> ({win_rate:.1f}%)\n"
-    else:
-        msg += f"Win/Loss: <code>0/0</code> (N/A)\n"
-    
-    msg += f"Final Balance: <code>${results['final_balance']:.2f}</code>\n"
-    msg += f"Return: <code>{results['total_return_pct']:+.2f}%</code>\n"
-    msg += f"Max Drawdown: <code>{results['max_drawdown']:.2f}%</code>\n\n"
-    
-    if results['blowup']:
-        msg += f"⚠️ <b>BLOWUP!</b> Date: <code>{results['blowup_date']}</code>\n\n"
-    
-    # Add trade details
+# ── Formatting ────────────────────────────────────────────────────────────────
+def fmt_results(res: Dict, trades: List) -> str:
+    wr = f"{res['wins']/res['total_trades']*100:.1f}%" if res['total_trades'] else "N/A"
+    s  = (f"<b>📊 XAU/USD Backtest</b>\n"
+          f"TF: <code>{P['timeframe'].upper()}</code>  "
+          f"{P['start_date']} → {P['end_date'] or 'today'}\n"
+          f"Lot: <code>{P['lot']}</code>  Trail: <code>{P['trailing_pct']}%</code>\n\n"
+          f"Trades: <code>{res['total_trades']}</code>  "
+          f"W/L: <code>{res['wins']}/{res['losses']}</code> ({wr})\n"
+          f"Total PnL: <code>${res['total_pnl']:+.2f}</code>\n"
+          f"Max Drawdown: <code>${res['max_dd']:.2f}</code>\n")
+    if res['open_count']:
+        s += f"Still open: <code>{res['open_count']}</code> trades\n"
     if trades:
-        msg += f"<b>📋 All {len(trades)} Trades:</b>\n"
-        for trade in trades:
-            sign = "✅" if trade['pnl_pct'] > 0 else "❌"
-            exit_type = "📍TS" if trade['type'] == 'trailing_stop' else "🔴SL"
-            msg += f"{sign} {exit_type} {trade['entry_date']}→{trade['exit_date']}: "
-            msg += f"<code>{trade['entry_price']:.2f}</code>→<code>{trade['exit_price']:.2f}</code> "
-            msg += f"<code>{trade['pnl_pct']:+.2f}%</code>\n"
-    else:
-        msg += f"<b>ℹ️ No trades detected in this period</b>\n"
-        msg += f"(No RSI(14) crossover signals found)\n"
-    
-    return msg
+        s += f"\n<b>Trades:</b>\n"
+        for t in trades:
+            icon = "✅" if t['pnl_usd'] > 0 else "❌"
+            tag  = "🔴" if t['type'] == 'stop' else "📍"
+            s += (f"{icon}{tag} {t['entry_date']}→{t['exit_date']}  "
+                  f"<code>{t['entry_price']:.2f}→{t['exit_price']:.2f}</code>  "
+                  f"<code>${t['pnl_usd']:+.2f}</code>\n")
+    return s
 
 
-# ============== TELEGRAM COMMAND HANDLERS ==============
+# ── Telegram handlers ─────────────────────────────────────────────────────────
+def _arg(msg, n=1):
+    parts = msg.text.split()
+    return parts[n] if len(parts) > n else None
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    """Start command"""
-    msg = """
-<b>🤖 XAU/USD Backtest Bot</b>
-
-<b>Commands:</b>
-/phiên - Set N periods (default: 20)
-/vốn - Set initial capital (default: $500)
-/timeframe - Set d/w/m (required)
-/time_start - Set start date dd/mm/yy (default: 01/01/2023)
-/time_end - Set end date dd/mm/yy (default: today)
-/x% - Set trailing stop % (default: 0%)
-/status - Show current parameters
-/run - Execute backtest
-/help - Detailed help
-    """
-    bot.send_message(message.chat.id, msg, parse_mode='HTML')
-
-@bot.message_handler(commands=['help'])
-def help_cmd(message):
-    """Help command"""
-    msg = """
-<b>📖 Parameter Guide</b>
-
-<b>🔹 /phiên &lt;number&gt;</b>
-N periods for avg price change
-Default: 20, Range: 5-100
-Example: /phiên 15
-
-<b>🔹 /vốn &lt;amount&gt;</b>
-Initial capital in USD
-Default: $500, Min: $10
-Example: /vốn 1000
-
-<b>🔹 /timeframe &lt;d|w|m&gt;</b>
-d = daily, w = weekly, m = monthly
-Example: /timeframe d
-
-<b>🔹 /time_start &lt;dd/mm/yy&gt;</b>
-Start date (default: 01/01/2023)
-Example: /time_start 01/01/2023
-
-<b>🔹 /time_end &lt;dd/mm/yy&gt;</b>
-End date (default: today)
-Example: /time_end 10/05/2026
-
-<b>🔹 /x% &lt;percent&gt;</b>
-Trailing stop % (default: 0%)
-Example: /x% 2.5
-
-<b>🔹 /status</b>
-Show current parameters
-
-<b>🔹 /run</b>
-Execute backtest with current parameters
-    """
-    bot.send_message(message.chat.id, msg, parse_mode='HTML')
-
-@bot.message_handler(commands=['phiên'])
-def set_n_periods(message):
-    """Set N periods"""
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /phiên <number>\nExample: /phiên 20")
-            return
-        
-        n = int(args[1])
-        if n < 5 or n > 100:
-            bot.send_message(message.chat.id, "❌ N periods must be 5-100")
-            return
-        
-        USER_PARAMS['n_periods'] = n
-        bot.send_message(message.chat.id, f"✅ N periods set to <code>{n}</code>", parse_mode='HTML')
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid input")
-
-@bot.message_handler(commands=['vốn'])
-def set_capital(message):
-    """Set initial capital"""
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /vốn <amount>\nExample: /vốn 500")
-            return
-        
-        capital = float(args[1])
-        if capital < 10:
-            bot.send_message(message.chat.id, "❌ Minimum capital: $10")
-            return
-        
-        USER_PARAMS['initial_capital'] = capital
-        bot.send_message(message.chat.id, f"✅ Capital set to <code>${capital:.2f}</code>", parse_mode='HTML')
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid input")
+@bot.message_handler(commands=['start','help'])
+def cmd_help(m):
+    bot.send_message(m.chat.id, (
+        "<b>🤖 XAU/USD Backtest Bot</b>\n\n"
+        "/timeframe d|w|m\n"
+        "/time_start dd/mm/yyyy\n"
+        "/time_end dd/mm/yyyy\n"
+        "/lot 0.01\n"
+        "/x% trailing stop %\n"
+        "/phiên N periods (vol avg)\n"
+        "/status  xem params\n"
+        "/run  chạy backtest"
+    ), parse_mode='HTML')
 
 @bot.message_handler(commands=['timeframe'])
-def set_timeframe(message):
-    """Set timeframe"""
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /timeframe <d|w|m>\nExample: /timeframe d")
-            return
-        
-        tf = args[1].lower()
-        if tf not in ['d', 'w', 'm']:
-            bot.send_message(message.chat.id, "❌ Use d (daily), w (weekly), or m (monthly)")
-            return
-        
-        USER_PARAMS['timeframe'] = tf
-        bot.send_message(message.chat.id, f"✅ Timeframe set to <code>{tf.upper()}</code>", parse_mode='HTML')
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid input")
+def cmd_tf(m):
+    v = _arg(m)
+    if v and v.lower() in ('d','w','m'):
+        P['timeframe'] = v.lower()
+        bot.send_message(m.chat.id, f"✅ Timeframe: <code>{v.upper()}</code>", parse_mode='HTML')
+    else:
+        bot.send_message(m.chat.id, "❌ /timeframe d|w|m")
 
 @bot.message_handler(commands=['time_start'])
-def set_start_date(message):
-    """Set start date"""
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /time_start <dd/mm/yy>\nExample: /time_start 01/01/2023")
-            return
-        
-        date_str = args[1]
-        parsed = None
-        for fmt in ('%d/%m/%Y', '%d/%m/%y'):
-            try:
-                parsed = datetime.strptime(date_str, fmt); break
-            except ValueError:
-                continue
-        if not parsed:
-            bot.send_message(message.chat.id, "❌ Sai format ngày (dùng dd/mm/yyyy, ví dụ: 01/01/2023)")
-            return
-        USER_PARAMS['start_date'] = date_str
-        bot.send_message(message.chat.id, f"✅ Start date set to <code>{date_str}</code>", parse_mode='HTML')
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid date format (use dd/mm/yy)")
+def cmd_start(m):
+    v = _arg(m)
+    if v and parse_date(v):
+        P['start_date'] = v
+        bot.send_message(m.chat.id, f"✅ Start: <code>{v}</code>", parse_mode='HTML')
+    else:
+        bot.send_message(m.chat.id, "❌ /time_start dd/mm/yyyy")
 
 @bot.message_handler(commands=['time_end'])
-def set_end_date(message):
-    """Set end date"""
+def cmd_end(m):
+    v = _arg(m)
+    if v and parse_date(v):
+        P['end_date'] = v
+        bot.send_message(m.chat.id, f"✅ End: <code>{v}</code>", parse_mode='HTML')
+    else:
+        bot.send_message(m.chat.id, "❌ /time_end dd/mm/yyyy")
+
+@bot.message_handler(commands=['lot'])
+def cmd_lot(m):
     try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /time_end <dd/mm/yy>\nExample: /time_end 10/05/2026")
-            return
-        
-        date_str = args[1]
-        parsed = None
-        for fmt in ('%d/%m/%Y', '%d/%m/%y'):
-            try:
-                parsed = datetime.strptime(date_str, fmt); break
-            except ValueError:
-                continue
-        if not parsed:
-            bot.send_message(message.chat.id, "❌ Sai format ngày (dùng dd/mm/yyyy, ví dụ: 10/05/2026)")
-            return
-        USER_PARAMS['end_date'] = date_str
-        bot.send_message(message.chat.id, f"✅ End date set to <code>{date_str}</code>", parse_mode='HTML')
+        v = float(_arg(m))
+        if 0.001 <= v <= 100:
+            P['lot'] = v
+            bot.send_message(m.chat.id, f"✅ Lot: <code>{v}</code>", parse_mode='HTML')
+        else:
+            bot.send_message(m.chat.id, "❌ Lot: 0.001 – 100")
     except:
-        bot.send_message(message.chat.id, "❌ Invalid date format (use dd/mm/yy)")
+        bot.send_message(m.chat.id, "❌ /lot 0.01")
 
 @bot.message_handler(commands=['x%'])
-def set_trailing_stop(message):
-    """Set trailing stop %"""
+def cmd_trail(m):
     try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /x% <percent>\nExample: /x% 2.5")
-            return
-        
-        pct = float(args[1])
-        if pct < 0 or pct > 100:
-            bot.send_message(message.chat.id, "❌ Trailing stop must be 0-100%")
-            return
-        
-        USER_PARAMS['trailing_stop_pct'] = pct
-        bot.send_message(message.chat.id, f"✅ Trailing stop set to <code>{pct}%</code>", parse_mode='HTML')
+        v = float(_arg(m))
+        P['trailing_pct'] = v
+        bot.send_message(m.chat.id, f"✅ Trailing: <code>{v}%</code>", parse_mode='HTML')
     except:
-        bot.send_message(message.chat.id, "❌ Invalid input")
+        bot.send_message(m.chat.id, "❌ /x% 2.5")
+
+@bot.message_handler(commands=['phiên'])
+def cmd_periods(m):
+    try:
+        v = int(_arg(m))
+        if 5 <= v <= 100:
+            P['n_periods'] = v
+            bot.send_message(m.chat.id, f"✅ N periods: <code>{v}</code>", parse_mode='HTML')
+        else:
+            bot.send_message(m.chat.id, "❌ 5–100")
+    except:
+        bot.send_message(m.chat.id, "❌ /phiên 20")
 
 @bot.message_handler(commands=['status'])
-def show_status(message):
-    """Show current parameters"""
-    msg = f"""
-<b>📌 Current Parameters</b>
-
-N Periods: <code>{USER_PARAMS['n_periods']}</code>
-Capital: <code>${USER_PARAMS['initial_capital']:.2f}</code>
-Timeframe: <code>{USER_PARAMS['timeframe'] or 'NOT SET'}</code>
-Start Date: <code>{USER_PARAMS['start_date']}</code>
-End Date: <code>{USER_PARAMS['end_date'] or 'today'}</code>
-Trailing Stop: <code>{USER_PARAMS['trailing_stop_pct']}%</code>
-
-Ready: <code>{'✅ YES' if USER_PARAMS['timeframe'] else '❌ NO (set timeframe)'}</code>
-    """
-    bot.send_message(message.chat.id, msg, parse_mode='HTML')
+def cmd_status(m):
+    bot.send_message(m.chat.id, (
+        f"<b>📌 Params</b>\n"
+        f"Timeframe: <code>{P['timeframe'] or 'NOT SET'}</code>\n"
+        f"Start: <code>{P['start_date']}</code>\n"
+        f"End: <code>{P['end_date'] or 'today'}</code>\n"
+        f"Lot: <code>{P['lot']}</code>\n"
+        f"Trailing: <code>{P['trailing_pct']}%</code>\n"
+        f"N periods: <code>{P['n_periods']}</code>"
+    ), parse_mode='HTML')
 
 @bot.message_handler(commands=['run'])
-def run_backtest(message):
-    """Execute backtest"""
-    chat_id = message.chat.id
-    
-    # Check required parameters
-    if not USER_PARAMS['timeframe']:
-        bot.send_message(chat_id, "❌ Set timeframe first: /timeframe d|w|m")
-        return
-    
-    bot.send_message(chat_id, "⏳ Running backtest... (may take 1-2 minutes)")
-    
-    try:
-        # Create backtester
-        backtester = XAUUSDBacktester(
-            timeframe=USER_PARAMS['timeframe'],
-            n_periods=USER_PARAMS['n_periods'],
-            trailing_stop_pct=USER_PARAMS['trailing_stop_pct'],
-            initial_capital=USER_PARAMS['initial_capital'],
-            start_date=USER_PARAMS['start_date'],
-            end_date=USER_PARAMS['end_date']
-        )
-        
-        # Fetch and process data
-        df = backtester.fetch_data()
-        if df is None or df.empty:
-            bot.send_message(
-                chat_id,
-                f"❌ <b>Cannot fetch data</b>\n"
-                f"Timeframe: <code>{USER_PARAMS['timeframe']}</code>\n"
-                f"Start: <code>{USER_PARAMS['start_date']}</code>\n"
-                f"End: <code>{USER_PARAMS['end_date'] or 'today'}</code>\n"
-                f"\nThử: XAUUSD=X và GC=F đều không có data.\n"
-                f"Kiểm tra lại ngày — yfinance không có daily data tương lai.",
-                parse_mode='HTML'
-            )
-            return
-        
-        df = backtester.calculate_indicators(df)
-        df = backtester.generate_signals(df)
-        
-        # Debug: count signals
-        buy_signals = (df['Signal'] == 1).sum()
-        sell_signals = (df['Signal'] == -1).sum()
-        total_signals = buy_signals + sell_signals
-        
-        # Show debug info
-        debug_msg = f"<b>🔍 Debug Info:</b>\n"
-        debug_msg += f"Candles: {len(df)}\n"
-        debug_msg += f"Buy signals: {buy_signals}\n"
-        debug_msg += f"Sell signals: {sell_signals}\n"
-        debug_msg += f"Total signals: {total_signals}\n\n"
-        
-        if total_signals > 0:
-            # Show last few signals
-            signal_rows = df[df['Signal'] != 0].tail(5)
-            debug_msg += f"<b>Latest signals:</b>\n"
-            for idx, row in signal_rows.iterrows():
-                sig_type = "🟢 BUY" if row['Signal'] == 1 else "🔴 SELL"
-                debug_msg += f"{sig_type} {str(idx.date())}: RSI={row['RSI']:.2f} SMA={row['SMA_RSI']:.2f}\n"
-        else:
-            # Show RSI vs SMA stats
-            valid_df = df.dropna(subset=['RSI', 'SMA_RSI'])
-            debug_msg += f"RSI range: {valid_df['RSI'].min():.2f} - {valid_df['RSI'].max():.2f}\n"
-            debug_msg += f"SMA(RSI) range: {valid_df['SMA_RSI'].min():.2f} - {valid_df['SMA_RSI'].max():.2f}\n"
-            debug_msg += f"<i>No crossovers detected</i>\n"
-        
-        bot.send_message(chat_id, debug_msg, parse_mode='HTML')
-        
-        # Run backtest
-        results, trades = backtester.run_backtest(df)
-        
-        # Format and send results
-        msg = format_results(results, trades)
-        bot.send_message(chat_id, msg, parse_mode='HTML')
-    
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ Error: {str(e)}")
+def cmd_run(m):
+    if not P['timeframe']:
+        bot.send_message(m.chat.id, "❌ Set timeframe first: /timeframe d|w|m"); return
 
-@bot.message_handler(func=lambda message: True)
-def handle_unknown(message):
-    """Handle unknown commands"""
-    bot.send_message(message.chat.id, "Unknown command. Type /help for available commands.")
+    bot.send_message(m.chat.id, "⏳ Fetching data & running backtest...")
+    try:
+        start = parse_date(P['start_date'])
+        end   = parse_date(P['end_date']) if P['end_date'] else None
+
+        df = fetch_data(P['timeframe'], start, end or datetime.now().strftime('%Y-%m-%d'))
+        if df is None or df.empty:
+            bot.send_message(m.chat.id, "❌ Cannot fetch data. Check date range."); return
+
+        df = add_indicators(df, P['n_periods'])
+        df = add_signals(df)
+
+        buys  = (df['Signal'] == 1).sum()
+        sells = (df['Signal'] == -1).sum()
+        bot.send_message(m.chat.id,
+            f"📶 Signals: 🟢{buys} buy / 🔴{sells} sell", parse_mode='HTML')
+
+        res, trades = run_backtest(df, start, P['lot'], P['trailing_pct'])
+        bot.send_message(m.chat.id, fmt_results(res, trades), parse_mode='HTML')
+
+    except Exception as e:
+        bot.send_message(m.chat.id, f"❌ Error: {e}")
+
+@bot.message_handler(func=lambda m: True)
+def cmd_unknown(m):
+    bot.send_message(m.chat.id, "Unknown command. /help")
 
 
 if __name__ == '__main__':
-    print("🚀 XAU/USD Backtest Bot is running...")
+    print("🚀 XAU/USD Backtest Bot running...")
     bot.infinity_polling(timeout=10, long_polling_timeout=10)
