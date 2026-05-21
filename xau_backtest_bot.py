@@ -144,12 +144,18 @@ def add_indicators(df: pd.DataFrame, n_periods: int) -> pd.DataFrame:
 
 
 def add_signals(df: pd.DataFrame) -> pd.DataFrame:
-    df['Signal'] = 0
-    rsi = df['RSI'].values; sma = df['SMA_RSI'].values
+    # Pandas 3.x Copy-on-Write: df['col'].iloc[i]=val là no-op
+    # → phải build numpy array rồi assign 1 lần duy nhất
+    rsi = df['RSI'].values
+    sma = df['SMA_RSI'].values
+    sig = np.zeros(len(df), dtype=int)
     for i in range(1, len(df)):
-        if any(np.isnan(x) for x in [rsi[i-1],sma[i-1],rsi[i],sma[i]]): continue
-        if rsi[i-1] <= sma[i-1] and rsi[i] > sma[i]:  df['Signal'].iloc[i] =  1
-        elif rsi[i-1] >= sma[i-1] and rsi[i] < sma[i]: df['Signal'].iloc[i] = -1
+        if any(np.isnan(x) for x in [rsi[i-1], sma[i-1], rsi[i], sma[i]]):
+            continue
+        if   rsi[i-1] <= sma[i-1] and rsi[i] > sma[i]: sig[i] =  1
+        elif rsi[i-1] >= sma[i-1] and rsi[i] < sma[i]: sig[i] = -1
+    df = df.copy()
+    df['Signal'] = sig
     return df
 
 
