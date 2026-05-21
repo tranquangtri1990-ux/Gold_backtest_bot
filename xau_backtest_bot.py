@@ -15,10 +15,8 @@ import threading
 from typing import Dict, Optional, Tuple, List
 
 import yfinance as yf
-try:
-    import pandas_datareader
-except ImportError:
-    pandas_datareader = None
+import requests
+import io
 
 # Initialize Telegram bot
 TELEGRAM_API_KEY = os.getenv('TELEGRAM_BT_VangDo_bot_API')
@@ -76,67 +74,74 @@ class XAUUSDBacktester:
                 continue
         return None
     
+    def _stooq_fetch_daily(self, start: str, end: str) -> Optional[pd.DataFrame]:
+        """Fetch daily XAUUSD từ Stooq qua CSV API (không cần thư viện thêm)"""
+        try:
+            d1 = start.replace('-', '')
+            d2 = end.replace('-', '')
+            url = f"https://stooq.com/q/d/l/?s=xauusd&d1={d1}&d2={d2}&i=d"
+            resp = requests.get(url, timeout=15,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200 or len(resp.text) < 50:
+                return None
+            df = pd.read_csv(io.StringIO(resp.text))
+            # Stooq trả: Date,Open,High,Low,Close,Volume
+            df.columns = [c.strip().capitalize() for c in df.columns]
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
+            if 'Volume' not in df.columns:
+                df['Volume'] = 0
+            return df[['Close', 'High', 'Low', 'Volume']].dropna(subset=['Close'])
+        except Exception as e:
+            print(f"  → Stooq HTTP error: {e}")
+            return None
+
     def fetch_data(self) -> Optional[pd.DataFrame]:
         """
-        Fetch XAU/USD Spot từ Stooq (spot forex, giống nguồn broker forex).
-        Stooq XAUUSD = spot gold USD/oz — khớp với OANDA/FXCM trên TradingView.
-        Fallback: XAUUSD=X (Yahoo), rồi GC=F (futures).
+        Fetch XAU/USD Spot — fallback chain:
+          1. Stooq XAUUSD  (spot forex, khớp OANDA/FXCM TradingView) — HTTP trực tiếp
+          2. XAUUSD=X      (Yahoo Finance spot)
+          3. GC=F           (Yahoo Finance futures — last resort)
         """
-        import pandas_datareader.data as web
+        end = self.end_date or datetime.now().strftime('%Y-%m-%d')
 
-        # Map timeframe cho stooq (không hỗ trợ weekly/monthly trực tiếp → resample)
-        try:
-            print("Trying Stooq XAUUSD (spot forex)...")
-            df = web.DataReader(
-                'XAUUSD',
-                'stooq',
-                start=self.start_date,
-                end=self.end_date,
-            )
-            if df is not None and not df.empty:
-                df = df.sort_index()
-                # Stooq trả daily → resample nếu cần weekly/monthly
-                if self.timeframe == 'w':
-                    df = df.resample('W').agg({
-                        'Open': 'first', 'High': 'max',
-                        'Low': 'min',   'Close': 'last', 'Volume': 'sum'
-                    }).dropna(subset=['Close'])
-                elif self.timeframe == 'm':
-                    df = df.resample('ME').agg({
-                        'Open': 'first', 'High': 'max',
-                        'Low': 'min',   'Close': 'last', 'Volume': 'sum'
-                    }).dropna(subset=['Close'])
+        # ── Source 1: Stooq ──────────────────────────────────────────────────
+        print("Trying Stooq XAUUSD (spot)...")
+        df = self._stooq_fetch_daily(self.start_date, end)
+        if df is not None and not df.empty:
+            # Resample nếu cần weekly / monthly
+            if self.timeframe == 'w':
+                df = df.resample('W').agg(
+                    {'Close': 'last', 'High': 'max', 'Low': 'min', 'Volume': 'sum'}
+                ).dropna(subset=['Close'])
+            elif self.timeframe == 'm':
+                df = df.resample('ME').agg(
+                    {'Close': 'last', 'High': 'max', 'Low': 'min', 'Volume': 'sum'}
+                ).dropna(subset=['Close'])
+            df.index.name = 'Date'
+            print(f"  ✓ {len(df)} bars | Stooq XAUUSD {self.timeframe.upper()}")
+            print(f"  Range: {df.index[0].date()} → {df.index[-1].date()}")
+            return df
+        print("  → Stooq failed, trying yfinance...")
 
-                if 'Volume' not in df.columns:
-                    df['Volume'] = 0
-                df = df[['Close', 'High', 'Low', 'Volume']].copy()
-                df.index.name = 'Date'
-                print(f"  ✓ {len(df)} bars | Stooq XAUUSD (spot) {self.timeframe.upper()}")
-                print(f"  Range: {df.index[0].date()} → {df.index[-1].date()}")
-                return df
-        except Exception as e:
-            print(f"  → Stooq error: {e}")
-
-        # Fallback: yfinance
-        tickers = [('XAUUSD=X', 'Yahoo Spot'), ('GC=F', 'Yahoo Futures')]
-        for ticker, label in tickers:
+        # ── Source 2 & 3: yfinance fallback ──────────────────────────────────
+        for ticker, label in [('XAUUSD=X', 'Yahoo Spot'), ('GC=F', 'Yahoo Futures')]:
             try:
                 print(f"Trying yfinance {ticker} ({label})...")
                 df = yf.download(
                     ticker,
                     start=self.start_date,
-                    end=self.end_date,
+                    end=end,
                     interval=self.interval,
                     progress=False,
                     auto_adjust=True,
                 )
                 if df is None or df.empty:
-                    continue
+                    print(f"  → Empty"); continue
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.droplevel(1)
-                missing = [c for c in ['Close', 'High', 'Low'] if c not in df.columns]
-                if missing:
-                    continue
+                if any(c not in df.columns for c in ['Close', 'High', 'Low']):
+                    print(f"  → Missing columns"); continue
                 if 'Volume' not in df.columns:
                     df['Volume'] = 0
                 df = df[['Close', 'High', 'Low', 'Volume']].copy()
@@ -148,7 +153,6 @@ class XAUUSDBacktester:
                 return df
             except Exception as e:
                 print(f"  → {ticker} error: {e}")
-                continue
 
         print("fetch_data: all sources failed")
         return None
