@@ -26,6 +26,7 @@ P = {   # user params
     'timeframe':    None,
     'start_date':   '01/01/2023',
     'end_date':     None,
+    'von':          1000.0,   # vốn ban đầu (USD)
     'lot':          0.01,
     'trailing_pct': 0.0,
     'n_periods':    20,
@@ -161,7 +162,7 @@ def add_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Backtest ──────────────────────────────────────────────────────────────────
 def run_backtest(df: pd.DataFrame, start_date: str,
-                 lot: float, trailing_pct: float) -> Tuple[Dict, List]:
+                 von: float, lot: float, trailing_pct: float) -> Tuple[Dict, List]:
     """
     PnL tuyệt đối theo lot forex:
         pnl_usd = (exit - entry) × lot × LOT_SIZE_OZ
@@ -169,13 +170,16 @@ def run_backtest(df: pd.DataFrame, start_date: str,
     Nhiều lệnh đồng thời: mỗi buy signal mở 1 lệnh mới độc lập.
     Sell signal đóng tất cả lệnh đang mở.
     Trailing stop = highest_high × (1 - stop_pct), chỉ đi lên.
+    Cháy tài khoản khi balance <= 0.
     """
     start_ts   = pd.Timestamp(start_date)
     open_trades: List[Dict] = []
     closed:      List[Dict] = []
+    balance     = von
     total_pnl   = 0.0
-    peak_pnl    = 0.0
+    peak_balance= von
     max_dd      = 0.0
+    blowup_date = None
 
     for i in range(len(df)):
         bar = df.index[i]
@@ -197,7 +201,7 @@ def run_backtest(df: pd.DataFrame, start_date: str,
             stop_lvl  = t['peak'] * (1 - stop_pct) if stop_pct > 0 else 0
             ep = None; etype = None
 
-            # Trailing stop TRƯỚC signal: stop là giá intrabar đã bị chạm
+            # Trailing stop TRƯỚC signal
             if stop_pct > 0 and low <= stop_lvl:
                 ep = fetch_minute(date_s, stop_lvl) or stop_lvl
                 etype = 'stop'
@@ -205,40 +209,53 @@ def run_backtest(df: pd.DataFrame, start_date: str,
                 ep, etype = price, 'signal'
 
             if ep is not None:
-                pnl = (ep - t['entry']) * lot * LOT_SIZE_OZ
+                pnl      = (ep - t['entry']) * lot * LOT_SIZE_OZ
                 total_pnl += pnl
+                balance   += pnl
                 closed.append({
                     'entry_date':  t['date'],
                     'entry_price': round(t['entry'], 2),
                     'exit_date':   date_s,
                     'exit_price':  round(ep, 2),
                     'pnl_usd':     round(pnl, 2),
+                    'balance':     round(max(balance, 0), 2),
                     'type':        etype,
                     'stop_lvl':    round(stop_lvl, 2),
                 })
+                # Cháy tài khoản: ghi nhận ngày, đóng tất cả lệnh còn lại
+                if balance <= 0 and blowup_date is None:
+                    blowup_date = date_s
+                    still_open  = []   # force đóng hết
+                    break             # dừng vòng loop trade
             else:
                 still_open.append(t)
 
         open_trades = still_open
 
-        # New entry on buy signal
+        # Dừng giao dịch khi đã cháy
+        if blowup_date:
+            break
+
+        # Chỉ mở lệnh mới khi còn vốn
         if signal == 1:
             open_trades.append({'entry': price, 'date': date_s, 'peak': high})
 
-        # Track max drawdown
-        peak_pnl = max(peak_pnl, total_pnl)
-        dd = peak_pnl - total_pnl
+        # Track max drawdown theo balance
+        peak_balance = max(peak_balance, balance)
+        dd = peak_balance - balance
         max_dd = max(max_dd, dd)
 
     wins   = sum(1 for t in closed if t['pnl_usd'] > 0)
     losses = len(closed) - wins
     return {
-        'total_trades': len(closed),
-        'wins':         wins,
-        'losses':       losses,
-        'total_pnl':    round(total_pnl, 2),
-        'max_dd':       round(max_dd, 2),
-        'open_count':   len(open_trades),
+        'total_trades':  len(closed),
+        'wins':          wins,
+        'losses':        losses,
+        'total_pnl':     round(total_pnl, 2),
+        'final_balance': round(max(balance, 0), 2),
+        'max_dd':        round(max_dd, 2),
+        'open_count':    len(open_trades),
+        'blowup':        blowup_date,
     }, closed
 
 
@@ -248,21 +265,26 @@ def fmt_results(res: Dict, trades: List) -> str:
     s  = (f"<b>📊 XAU/USD Backtest</b>\n"
           f"TF: <code>{P['timeframe'].upper()}</code>  "
           f"{P['start_date']} → {P['end_date'] or 'today'}\n"
+          f"Vốn: <code>${P['von']:,.2f}</code>  "
           f"Lot: <code>{P['lot']}</code>  Trail: <code>{P['trailing_pct']}%</code>\n\n"
           f"Trades: <code>{res['total_trades']}</code>  "
           f"W/L: <code>{res['wins']}/{res['losses']}</code> ({wr})\n"
-          f"Total PnL: <code>${res['total_pnl']:+.2f}</code>\n"
-          f"Max Drawdown: <code>${res['max_dd']:.2f}</code>\n")
+          f"Total PnL:     <code>${res['total_pnl']:+.2f}</code>\n"
+          f"Final balance: <code>${res['final_balance']:,.2f}</code>\n"
+          f"Max Drawdown:  <code>${res['max_dd']:.2f}</code>\n")
+    if res['blowup']:
+        s += f"💥 <b>CHÁY TÀI KHOẢN</b> ngày <code>{res['blowup']}</code>\n"
     if res['open_count']:
-        s += f"Still open: <code>{res['open_count']}</code> trades\n"
+        s += f"⏳ Còn mở: <code>{res['open_count']}</code> lệnh chưa đóng\n"
     if trades:
         s += f"\n<b>Trades:</b>\n"
         for t in trades:
             icon = "✅" if t['pnl_usd'] > 0 else "❌"
-            tag  = "🔴" if t['type'] == 'stop' else "📍"
+            tag  = "🛑" if t['type'] == 'stop' else "📍"
             s += (f"{icon}{tag} {t['entry_date']}→{t['exit_date']}  "
                   f"<code>{t['entry_price']:.2f}→{t['exit_price']:.2f}</code>  "
-                  f"<code>${t['pnl_usd']:+.2f}</code>\n")
+                  f"<code>${t['pnl_usd']:+.2f}</code>  "
+                  f"bal:<code>${t['balance']:,.2f}</code>\n")
     return s
 
 
@@ -278,6 +300,7 @@ def cmd_help(m):
         "/timeframe d|w|m\n"
         "/time_start dd/mm/yyyy\n"
         "/time_end dd/mm/yyyy\n"
+        "/vốn 1000  (vốn ban đầu USD)\n"
         "/lot 0.01\n"
         "/x% trailing stop %\n"
         "/phiên N periods (vol avg)\n"
@@ -311,6 +334,18 @@ def cmd_end(m):
         bot.send_message(m.chat.id, f"✅ End: <code>{v}</code>", parse_mode='HTML')
     else:
         bot.send_message(m.chat.id, "❌ /time_end dd/mm/yyyy")
+
+@bot.message_handler(commands=['vốn'])
+def cmd_von(m):
+    try:
+        v = float(_arg(m))
+        if v > 0:
+            P['von'] = v
+            bot.send_message(m.chat.id, f"✅ Vốn: <code>${v:,.2f}</code>", parse_mode='HTML')
+        else:
+            bot.send_message(m.chat.id, "❌ Vốn phải > 0")
+    except:
+        bot.send_message(m.chat.id, "❌ /vốn 1000")
 
 @bot.message_handler(commands=['lot'])
 def cmd_lot(m):
@@ -352,6 +387,7 @@ def cmd_status(m):
         f"Timeframe: <code>{P['timeframe'] or 'NOT SET'}</code>\n"
         f"Start: <code>{P['start_date']}</code>\n"
         f"End: <code>{P['end_date'] or 'today'}</code>\n"
+        f"Vốn: <code>${P['von']:,.2f}</code>\n"
         f"Lot: <code>{P['lot']}</code>\n"
         f"Trailing: <code>{P['trailing_pct']}%</code>\n"
         f"N periods: <code>{P['n_periods']}</code>"
@@ -379,7 +415,7 @@ def cmd_run(m):
         bot.send_message(m.chat.id,
             f"📶 Signals: 🟢{buys} buy / 🔴{sells} sell", parse_mode='HTML')
 
-        res, trades = run_backtest(df, start, P['lot'], P['trailing_pct'])
+        res, trades = run_backtest(df, start, P['von'], P['lot'], P['trailing_pct'])
         bot.send_message(m.chat.id, fmt_results(res, trades), parse_mode='HTML')
 
     except Exception as e:
