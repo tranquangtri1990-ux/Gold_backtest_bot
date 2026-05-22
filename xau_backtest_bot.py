@@ -297,43 +297,17 @@ def fmt_trade_lines(trades: List) -> List[str]:
 
 def send_results(chat_id: int, res: Dict, trades: List):
     """
-    Gửi summary luôn.
-    Nếu trade list vừa trong 1 message → gửi kèm.
-    Nếu quá dài → gửi thành nhiều message, mỗi cái ≤ 4096 ký tự.
+    Nếu summary + trades vừa ≤ 4096 ký tự → gửi đầy đủ.
+    Nếu quá dài → chỉ gửi summary, bỏ danh sách từng lệnh.
     """
-    summary = fmt_summary(res)
-
-    if not trades:
-        bot.send_message(chat_id, summary, parse_mode='HTML')
-        return
-
-    header    = "\n<b>Trades:</b>\n"
+    summary     = fmt_summary(res)
     trade_lines = fmt_trade_lines(trades)
-    full_list   = header + "\n".join(trade_lines)
+    full        = summary + "\n<b>Trades:</b>\n" + "\n".join(trade_lines)
 
-    # Thử gửi tất cả trong 1 message
-    if len(summary) + len(full_list) <= TG_LIMIT:
-        bot.send_message(chat_id, summary + full_list, parse_mode='HTML')
-        return
-
-    # Quá dài → gửi summary trước, kèm ghi chú
-    bot.send_message(
-        chat_id,
-        summary + f"\n📋 Danh sách <code>{len(trades)}</code> trades (gửi tiếp theo):",
-        parse_mode='HTML'
-    )
-
-    # Gom trade lines thành các message ≤ TG_LIMIT
-    chunk = "<b>Trades (tiếp theo):</b>\n"
-    for line in trade_lines:
-        candidate = chunk + line + "\n"
-        if len(candidate) > TG_LIMIT:
-            bot.send_message(chat_id, chunk, parse_mode='HTML')
-            chunk = line + "\n"
-        else:
-            chunk = candidate
-    if chunk.strip():
-        bot.send_message(chat_id, chunk, parse_mode='HTML')
+    if len(full) <= TG_LIMIT:
+        bot.send_message(chat_id, full, parse_mode='HTML')
+    else:
+        bot.send_message(chat_id, summary, parse_mode='HTML')
 
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
