@@ -260,7 +260,10 @@ def run_backtest(df: pd.DataFrame, start_date: str,
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
-def fmt_results(res: Dict, trades: List) -> str:
+TG_LIMIT = 4096
+
+def fmt_summary(res: Dict) -> str:
+    """Phần tóm tắt — luôn gửi, không bao giờ vượt giới hạn"""
     wr = f"{res['wins']/res['total_trades']*100:.1f}%" if res['total_trades'] else "N/A"
     s  = (f"<b>📊 XAU/USD Backtest</b>\n"
           f"TF: <code>{P['timeframe'].upper()}</code>  "
@@ -273,19 +276,64 @@ def fmt_results(res: Dict, trades: List) -> str:
           f"Final balance: <code>${res['final_balance']:,.2f}</code>\n"
           f"Max Drawdown:  <code>${res['max_dd']:.2f}</code>\n")
     if res['blowup']:
-        s += f"💥 <b>CHÁY TÀI KHOẢN</b> ngày <code>{res['blowup']}</code>\n"
+        s += f"\n💥 <b>CHÁY TÀI KHOẢN</b> ngày <code>{res['blowup']}</code>\n"
     if res['open_count']:
         s += f"⏳ Còn mở: <code>{res['open_count']}</code> lệnh chưa đóng\n"
-    if trades:
-        s += f"\n<b>Trades:</b>\n"
-        for t in trades:
-            icon = "✅" if t['pnl_usd'] > 0 else "❌"
-            tag  = "🛑" if t['type'] == 'stop' else "📍"
-            s += (f"{icon}{tag} {t['entry_date']}→{t['exit_date']}  "
-                  f"<code>{t['entry_price']:.2f}→{t['exit_price']:.2f}</code>  "
-                  f"<code>${t['pnl_usd']:+.2f}</code>  "
-                  f"bal:<code>${t['balance']:,.2f}</code>\n")
     return s
+
+def fmt_trade_lines(trades: List) -> List[str]:
+    """Mỗi trade = 1 dòng string"""
+    lines = []
+    for t in trades:
+        icon = "✅" if t['pnl_usd'] > 0 else "❌"
+        tag  = "🛑" if t['type'] == 'stop' else "📍"
+        lines.append(
+            f"{icon}{tag} {t['entry_date']}→{t['exit_date']}  "
+            f"<code>{t['entry_price']:.2f}→{t['exit_price']:.2f}</code>  "
+            f"<code>${t['pnl_usd']:+.2f}</code>  "
+            f"bal:<code>${t['balance']:,.2f}</code>"
+        )
+    return lines
+
+def send_results(chat_id: int, res: Dict, trades: List):
+    """
+    Gửi summary luôn.
+    Nếu trade list vừa trong 1 message → gửi kèm.
+    Nếu quá dài → gửi thành nhiều message, mỗi cái ≤ 4096 ký tự.
+    """
+    summary = fmt_summary(res)
+
+    if not trades:
+        bot.send_message(chat_id, summary, parse_mode='HTML')
+        return
+
+    header    = "\n<b>Trades:</b>\n"
+    trade_lines = fmt_trade_lines(trades)
+    full_list   = header + "\n".join(trade_lines)
+
+    # Thử gửi tất cả trong 1 message
+    if len(summary) + len(full_list) <= TG_LIMIT:
+        bot.send_message(chat_id, summary + full_list, parse_mode='HTML')
+        return
+
+    # Quá dài → gửi summary trước, kèm ghi chú
+    bot.send_message(
+        chat_id,
+        summary + f"\n📋 Danh sách <code>{len(trades)}</code> trades (gửi tiếp theo):",
+        parse_mode='HTML'
+    )
+
+    # Gom trade lines thành các message ≤ TG_LIMIT
+    chunk = "<b>Trades (tiếp theo):</b>\n"
+    for line in trade_lines:
+        candidate = chunk + line + "\n"
+        if len(candidate) > TG_LIMIT:
+            bot.send_message(chat_id, chunk, parse_mode='HTML')
+            chunk = line + "\n"
+        else:
+            chunk = candidate
+    if chunk.strip():
+        bot.send_message(chat_id, chunk, parse_mode='HTML')
 
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
@@ -416,7 +464,7 @@ def cmd_run(m):
             f"📶 Signals: 🟢{buys} buy / 🔴{sells} sell", parse_mode='HTML')
 
         res, trades = run_backtest(df, start, P['von'], P['lot'], P['trailing_pct'])
-        bot.send_message(m.chat.id, fmt_results(res, trades), parse_mode='HTML')
+        send_results(m.chat.id, res, trades)
 
     except Exception as e:
         bot.send_message(m.chat.id, f"❌ Error: {e}")
